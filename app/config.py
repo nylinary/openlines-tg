@@ -12,7 +12,8 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000)
 
     # Connector
-    connector_code: str = Field(default="tgproxy", alias="CONNECTOR_CODE")
+    # Must be one of codes returned by imconnector.list (e.g. telegrambot, vkgroup, whatsappbytwilio, ...)
+    connector_code: str = Field(default="telegrambot", alias="CONNECTOR_CODE")
 
     # Bitrix24 (OAuth app)
     b24_domain: str = Field(alias="B24_DOMAIN")  # e.g. b24-gko4ik.bitrix24.ru

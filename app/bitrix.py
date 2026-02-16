@@ -151,13 +151,28 @@ class BitrixClient:
         raise BitrixError(f"Bitrix call failed after retries: {method}: {last_err}")
 
     async def register(self, connector: str) -> Dict[str, Any]:
-        return await self.call(
-            "imconnector.register",
-            {
-                "CONNECTOR": connector,
-                "NAME": connector,
-            },
-        )
+        """Register connector (best-effort).
+
+        Some portals deny custom provider registration for local apps and return
+        CONNECTOR_ID_REQUIRED, while still allowing activate/status/send.messages
+        when the connector code is already configured on the portal.
+
+        In that case, we treat it as non-fatal and let runtime calls decide.
+        """
+        try:
+            return await self.call(
+                "imconnector.register",
+                {
+                    "CONNECTOR": connector,
+                    "NAME": connector,
+                },
+            )
+        except BitrixError as e:
+            msg = str(e)
+            if "CONNECTOR_ID_REQUIRED" in msg or "ID коннектора" in msg:
+                log.warning("bitrix_register_skipped", extra={"reason": msg, "connector": connector})
+                return {"error": "register_skipped", "error_description": msg}
+            raise
 
     async def activate(self, connector: str, line_id: str) -> Dict[str, Any]:
         return await self.call(
