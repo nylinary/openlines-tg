@@ -5,7 +5,7 @@ import secrets
 import logging
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from .bitrix import BitrixClient, BitrixError, BitrixOAuthError
 from .config import Settings, get_settings
@@ -246,35 +246,6 @@ def telegram_dep() -> TelegramClient:
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
-    return {"ok": "true"}
-
-
-@app.post("/tg/webhook")
-async def tg_webhook(
-    update: TelegramUpdate,
-    request: Request,
-    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
-    settings: Settings = Depends(settings_dep),
-    storage: Storage = Depends(storage_dep),
-    bitrix: BitrixClient = Depends(bitrix_dep),
-    telegram: TelegramClient = Depends(telegram_dep),
-) -> Dict[str, str]:
-    # Webhook mode is optional now; if polling is enabled, we can still accept webhook,
-    # but the secret must match when TG_WEBHOOK_SECRET is configured.
-    if not settings.tg_use_polling:
-        try:
-            telegram.verify_secret(x_telegram_bot_api_secret_token, settings.tg_webhook_secret)
-        except TelegramError:
-            raise HTTPException(status_code=401, detail="invalid telegram secret")
-    else:
-        # If user still wants to keep webhook enabled while polling is on, allow it only when secret matches.
-        if settings.tg_webhook_secret:
-            try:
-                telegram.verify_secret(x_telegram_bot_api_secret_token, settings.tg_webhook_secret)
-            except TelegramError:
-                raise HTTPException(status_code=401, detail="invalid telegram secret")
-
-    await _process_tg_update(settings, storage, bitrix, update)
     return {"ok": "true"}
 
 
