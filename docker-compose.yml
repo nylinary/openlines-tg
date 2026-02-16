@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - B24_BASE=${B24_BASE}
+      - B24_LINE_ID=${B24_LINE_ID}
+      - B24_HANDLER_SECRET=${B24_HANDLER_SECRET}
+      - CONNECTOR_CODE=${CONNECTOR_CODE:-tgproxy}
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
+      - TG_WEBHOOK_SECRET=${TG_WEBHOOK_SECRET}
+      - HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S:-10}
+      - HTTP_RETRIES=${HTTP_RETRIES:-3}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
