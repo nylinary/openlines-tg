@@ -20,6 +20,21 @@ class BitrixOAuthError(BitrixError):
     pass
 
 
+def _redact_bitrix_url(url: str) -> str:
+    # Hide auth token in logs
+    return url.replace("auth=", "auth=***")
+
+
+def _redact_form(data: Dict[str, Any]) -> Dict[str, Any]:
+    redacted: Dict[str, Any] = {}
+    for k, v in data.items():
+        if k.upper() in {"AUTH", "ACCESS_TOKEN", "REFRESH_TOKEN", "CLIENT_SECRET", "HASH"}:
+            redacted[k] = "***"
+        else:
+            redacted[k] = v
+    return redacted
+
+
 class BitrixClient:
     def __init__(
         self,
@@ -116,6 +131,19 @@ class BitrixClient:
         access_token = await self.ensure_token()
         url = self._url(method, access_token)
         form = data or {}
+
+        # Log raw outgoing request for debugging (redacted)
+        try:
+            log.info(
+                "bitrix_http_request",
+                extra={
+                    "method": method,
+                    "url": _redact_bitrix_url(url),
+                    "form": _redact_form({k: ("" if v is None else str(v)) for k, v in form.items()}),
+                },
+            )
+        except Exception:
+            pass
 
         last_err: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
@@ -235,13 +263,15 @@ class BitrixClient:
         event_handler: str,
         openline: str = "Y",
     ) -> Dict[str, Any]:
+        safe_name = (name or "").strip() or code
         payload: Dict[str, Any] = {
             "CODE": code,
             "TYPE": "B",
             "EVENT_HANDLER": event_handler,
             "OPENLINE": openline,
             "PROPERTIES": {
-                "NAME": name,
+                "NAME": safe_name,
+                "LAST_NAME": "",
                 "COLOR": "AQUA",
             },
         }
