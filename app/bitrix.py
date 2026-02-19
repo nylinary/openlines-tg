@@ -31,6 +31,7 @@ class BitrixClient:
         storage: Storage,
         timeout_s: float = 10.0,
         retries: int = 3,
+        connector_hash: str = "",
     ):
         self.domain = domain.strip().replace("https://", "").replace("http://", "").rstrip("/")
         self.client_id = client_id
@@ -39,6 +40,7 @@ class BitrixClient:
         self.storage = storage
         self.timeout_s = timeout_s
         self.retries = retries
+        self.connector_hash = connector_hash
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def close(self) -> None:
@@ -194,36 +196,67 @@ class BitrixClient:
         )
 
     async def send_messages(self, connector: str, line_id: str, messages: list[Dict[str, Any]]) -> Dict[str, Any]:
-        return await self.call(
-            "imconnector.send.messages",
-            {
-                "CONNECTOR": connector,
-                "LINE": line_id,
-                **_encode_messages(messages),
-            },
-        )
+        payload: Dict[str, Any] = {
+            "CONNECTOR": connector,
+            "LINE": line_id,
+            **_encode_messages(messages),
+        }
+        if self.connector_hash:
+            payload["HASH"] = self.connector_hash
+        return await self.call("imconnector.send.messages", payload)
 
     async def send_status_delivery(self, connector: str, line_id: str, chat_id: str, message_id: str) -> Dict[str, Any]:
-        return await self.call(
-            "imconnector.send.status.delivery",
-            {
-                "CONNECTOR": connector,
-                "LINE": line_id,
-                "CHAT_ID": chat_id,
-                "MESSAGE_ID": message_id,
-            },
-        )
+        payload: Dict[str, Any] = {
+            "CONNECTOR": connector,
+            "LINE": line_id,
+            "CHAT_ID": chat_id,
+            "MESSAGE_ID": message_id,
+        }
+        if self.connector_hash:
+            payload["HASH"] = self.connector_hash
+        return await self.call("imconnector.send.status.delivery", payload)
 
     async def send_status_reading(self, connector: str, line_id: str, chat_id: str, message_id: str) -> Dict[str, Any]:
-        return await self.call(
-            "imconnector.send.status.reading",
-            {
-                "CONNECTOR": connector,
-                "LINE": line_id,
-                "CHAT_ID": chat_id,
-                "MESSAGE_ID": message_id,
+        payload: Dict[str, Any] = {
+            "CONNECTOR": connector,
+            "LINE": line_id,
+            "CHAT_ID": chat_id,
+            "MESSAGE_ID": message_id,
+        }
+        if self.connector_hash:
+            payload["HASH"] = self.connector_hash
+        return await self.call("imconnector.send.status.reading", payload)
+
+    async def imbot_register(
+        self,
+        *,
+        code: str,
+        name: str,
+        event_handler: str,
+        openline: str = "Y",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "CODE": code,
+            "TYPE": "B",
+            "EVENT_HANDLER": event_handler,
+            "OPENLINE": openline,
+            "PROPERTIES": {
+                "NAME": name,
+                "COLOR": "AQUA",
             },
-        )
+        }
+        return await self.call("imbot.register", payload)
+
+    async def imbot_update(self, *, bot_id: str, name: Optional[str] = None, event_handler: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"BOT_ID": bot_id}
+        props: Dict[str, Any] = {}
+        if name is not None:
+            props["NAME"] = name
+        if event_handler is not None:
+            payload["EVENT_HANDLER"] = event_handler
+        if props:
+            payload["PROPERTIES"] = props
+        return await self.call("imbot.update", payload)
 
 
 def _encode_messages(messages: list[Dict[str, Any]]) -> Dict[str, Any]:

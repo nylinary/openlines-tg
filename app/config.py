@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     # Must be one of codes returned by imconnector.list (e.g. telegrambot, vkgroup, whatsappbytwilio, ...)
     connector_code: str = Field(default="telegrambot", alias="CONNECTOR_CODE")
 
+    # Some connectors require an extra HASH parameter for sending messages.
+    b24_connector_hash: str = Field(default="", alias="B24_CONNECTOR_HASH")
+
     # Bitrix24 (OAuth app)
     b24_domain: str = Field(alias="B24_DOMAIN")  # e.g. b24-gko4ik.bitrix24.ru
     b24_client_id: str = Field(alias="B24_CLIENT_ID")
@@ -27,6 +30,12 @@ class Settings(BaseSettings):
 
     # Secret for /b24/handler (either header X-B24-Handler-Secret or query ?secret=)
     b24_handler_secret: str = Field(alias="B24_HANDLER_SECRET")
+
+    # Bitrix imbot (optional) — for echo testing inside Bitrix
+    b24_imbot_code: str = Field(default="openlines_test_bot", alias="B24_IMBOT_CODE")
+    b24_imbot_name: str = Field(default="OpenLines Test Bot", alias="B24_IMBOT_NAME")
+    # Public URL where Bitrix can send bot events (messages, etc). Must be reachable from Bitrix.
+    b24_imbot_event_handler: str = Field(default="", alias="B24_IMBOT_EVENT_HANDLER")
 
     # Telegram
     tg_bot_token: str = Field(alias="TG_BOT_TOKEN")

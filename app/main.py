@@ -14,7 +14,6 @@ from .schemas import BitrixEventEnvelope, TelegramUpdate
 from .storage import Storage
 from .telegram import TelegramClient, TelegramError
 
-
 log = logging.getLogger("app")
 
 app = FastAPI(title="tg-b24-openlines-proxy", version="0.1.0")
@@ -179,12 +178,31 @@ async def _startup() -> None:
         storage=app.state.storage,
         timeout_s=settings.http_timeout_s,
         retries=settings.http_retries,
+        connector_hash=settings.b24_connector_hash,
     )
     app.state.telegram = TelegramClient(settings.tg_bot_token, timeout_s=settings.http_timeout_s, retries=settings.http_retries)
 
     # Register/activate only when OAuth token is installed.
     try:
         await app.state.bitrix.ensure_token()
+
+        # imbot register/update for echo testing (best-effort)
+        if settings.b24_imbot_event_handler:
+            try:
+                resp = await app.state.bitrix.imbot_register(
+                    code=settings.b24_imbot_code,
+                    name=settings.b24_imbot_name,
+                    event_handler=settings.b24_imbot_event_handler,
+                    openline="Y",
+                )
+                bot_id = str((resp.get("result") or {}).get("BOT_ID") or "")
+                if bot_id:
+                    log.info("b24_imbot_registered", extra={"bot_id": bot_id, "code": settings.b24_imbot_code})
+            except Exception as e:
+                log.warning("b24_imbot_register_failed", extra={"error": str(e)})
+        else:
+            log.info("b24_imbot_skipped", extra={"reason": "B24_IMBOT_EVENT_HANDLER not set"})
+
         try:
             await app.state.bitrix.register(settings.connector_code)
             log.info("bitrix_connector_registered", extra={"connector": settings.connector_code})
@@ -345,5 +363,44 @@ async def b24_oauth_callback(
         await app.state.bitrix.activate(settings.connector_code, settings.b24_line_id)
     except Exception as e:
         log.warning("bitrix_post_install_register_failed", extra={"error": str(e)})
+
+    return {"ok": "true"}
+
+
+@app.post("/b24/imbot/events")
+async def b24_imbot_events(
+    payload: Dict[str, Any],
+    settings: Settings = Depends(settings_dep),
+    bitrix: BitrixClient = Depends(bitrix_dep),
+) -> Dict[str, str]:
+    """Bitrix imbot event handler.
+
+    For testing: echoes incoming message text back to the same dialog.
+
+    Configure Bitrix bot EVENT_HANDLER to point here.
+    """
+    # Typical event payload contains `data[PARAMS][DIALOG_ID]` + `data[PARAMS][MESSAGE]`.
+    data = payload.get("data") if isinstance(payload, dict) else None
+    params = data.get("PARAMS") if isinstance(data, dict) else None
+
+    dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
+    message = params.get("MESSAGE") if isinstance(params, dict) else None
+
+    if not isinstance(dialog_id, str) or not dialog_id:
+        log.info("imbot_event_ignored", extra={"reason": "no_dialog_id"})
+        return {"ok": "true"}
+
+    if not isinstance(message, str):
+        message = ""
+
+    # Avoid echo loops for empty/system messages
+    text = message.strip()
+    if not text:
+        return {"ok": "true"}
+
+    try:
+        await bitrix.call("im.message.add", {"DIALOG_ID": dialog_id, "MESSAGE": f"echo: {text}"})
+    except Exception as e:
+        log.warning("imbot_echo_failed", extra={"error": str(e)})
 
     return {"ok": "true"}
