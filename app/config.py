@@ -31,11 +31,16 @@ class Settings(BaseSettings):
     # Secret for /b24/handler (either header X-B24-Handler-Secret or query ?secret=)
     b24_handler_secret: str = Field(alias="B24_HANDLER_SECRET")
 
+    public_domain: str = Field(alias="PUBLIC_DOMAIN")
     # Bitrix imbot (optional) — for echo testing inside Bitrix
     b24_imbot_code: str = Field(default="openlines_test_bot", alias="B24_IMBOT_CODE")
     b24_imbot_name: str = Field(default="OpenLines Test Bot", alias="B24_IMBOT_NAME")
+
     # Public URL where Bitrix can send bot events (messages, etc). Must be reachable from Bitrix.
-    b24_imbot_event_handler: str = Field(default="", alias="B24_IMBOT_EVENT_HANDLER")
+
+    @property
+    def b24_imbot_event_handler(self) -> str:
+        return f"https://{self.public_domain}/b24/imbot/events"
 
     # Telegram
     tg_bot_token: str = Field(alias="TG_BOT_TOKEN")
