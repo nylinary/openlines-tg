@@ -195,7 +195,14 @@ async def _startup() -> None:
                     event_handler=settings.b24_imbot_event_handler,
                     openline="Y",
                 )
-                bot_id = str((resp.get("result") or {}).get("BOT_ID") or "")
+
+                result = resp.get("result")
+                bot_id = ""
+                if isinstance(result, dict):
+                    bot_id = str(result.get("BOT_ID") or "")
+                elif isinstance(result, int):
+                    bot_id = str(result)
+
                 if bot_id:
                     log.info("b24_imbot_registered", extra={"bot_id": bot_id, "code": settings.b24_imbot_code})
                 else:
