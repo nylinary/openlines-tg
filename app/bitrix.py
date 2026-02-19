@@ -127,10 +127,22 @@ class BitrixClient:
     def _url(self, method: str, access_token: str) -> str:
         return f"https://{self.domain}/rest/{method}.json?auth={access_token}"
 
-    async def call(self, method: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def call(
+        self,
+        method: str,
+        data: Optional[Dict[str, Any]] = None,
+        *,
+        use_bearer: bool = False,
+        json_body: bool = False,
+    ) -> Dict[str, Any]:
         access_token = await self.ensure_token()
-        url = self._url(method, access_token)
-        form = data or {}
+
+        url = self._url(method, access_token) if not use_bearer else f"https://{self.domain}/rest/{method}.json"
+        form_or_json = data or {}
+
+        headers: Dict[str, str] = {}
+        if use_bearer:
+            headers["Authorization"] = f"Bearer {access_token}"
 
         # Log raw outgoing request for debugging (redacted)
         try:
@@ -139,7 +151,9 @@ class BitrixClient:
                 extra={
                     "method": method,
                     "url": _redact_bitrix_url(url),
-                    "form": _redact_form({k: ("" if v is None else str(v)) for k, v in form.items()}),
+                    "headers": {k: ("Bearer ***" if k.lower() == "authorization" else v) for k, v in headers.items()},
+                    "body_type": "json" if json_body else "form",
+                    "body": _redact_form({k: ("" if v is None else str(v)) for k, v in form_or_json.items()}),
                 },
             )
         except Exception:
@@ -148,13 +162,23 @@ class BitrixClient:
         last_err: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                r = await self._client.post(url, data=form)
+                if json_body:
+                    r = await self._client.post(url, json=form_or_json, headers=headers)
+                else:
+                    r = await self._client.post(url, data=form_or_json, headers=headers)
+
                 if r.status_code in (401, 403):
-                    # Token might be expired/revoked; try one refresh.
                     await self.refresh()
                     access_token = await self.ensure_token()
-                    url = self._url(method, access_token)
-                    r = await self._client.post(url, data=form)
+                    if use_bearer:
+                        headers["Authorization"] = f"Bearer {access_token}"
+                        url = f"https://{self.domain}/rest/{method}.json"
+                    else:
+                        url = self._url(method, access_token)
+                    if json_body:
+                        r = await self._client.post(url, json=form_or_json, headers=headers)
+                    else:
+                        r = await self._client.post(url, data=form_or_json, headers=headers)
 
                 if r.status_code in (429, 500, 502, 503, 504):
                     raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
@@ -275,7 +299,8 @@ class BitrixClient:
                 "COLOR": "AQUA",
             },
         }
-        return await self.call("imbot.register", payload)
+        # imbot.register frequently expects JSON and works reliably with Bearer auth
+        return await self.call("imbot.register", payload, use_bearer=True, json_body=True)
 
     async def imbot_update(self, *, bot_id: str, name: Optional[str] = None, event_handler: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"BOT_ID": bot_id}
@@ -286,7 +311,7 @@ class BitrixClient:
             payload["EVENT_HANDLER"] = event_handler
         if props:
             payload["PROPERTIES"] = props
-        return await self.call("imbot.update", payload)
+        return await self.call("imbot.update", payload, use_bearer=True, json_body=True)
 
 
 def _encode_messages(messages: list[Dict[str, Any]]) -> Dict[str, Any]:
