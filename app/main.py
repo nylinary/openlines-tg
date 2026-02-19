@@ -198,8 +198,13 @@ async def _startup() -> None:
                 bot_id = str((resp.get("result") or {}).get("BOT_ID") or "")
                 if bot_id:
                     log.info("b24_imbot_registered", extra={"bot_id": bot_id, "code": settings.b24_imbot_code})
+                else:
+                    log.warning("b24_imbot_register_no_bot_id", extra={"response": resp})
             except Exception as e:
-                log.warning("b24_imbot_register_failed", extra={"error": str(e)})
+                log.warning(
+                    "b24_imbot_register_failed",
+                    extra={"error": str(e), "event_handler": settings.b24_imbot_event_handler, "code": settings.b24_imbot_code},
+                )
         else:
             log.info("b24_imbot_skipped", extra={"reason": "B24_IMBOT_EVENT_HANDLER not set"})
 
