@@ -4,7 +4,7 @@ import logging
 import secrets
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from .bitrix import BitrixClient, BitrixOAuthError
 from .config import Settings, get_settings
@@ -99,24 +99,84 @@ async def health() -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _parse_nested_form(form: Dict[str, str]) -> Dict[str, Any]:
+    """Parse flat form keys like ``data[PARAMS][DIALOG_ID]`` into a nested dict.
+
+    Bitrix sends bot events as ``application/x-www-form-urlencoded`` with keys
+    such as ``data[PARAMS][DIALOG_ID]=123``.  This helper reconstructs the
+    nested structure so the rest of the code can work with a normal dict.
+    """
+    import re
+
+    result: Dict[str, Any] = {}
+    key_re = re.compile(r"\[([^\]]*)\]")
+
+    for raw_key, value in form.items():
+        # Split "data[PARAMS][DIALOG_ID]" → root="data", parts=["PARAMS","DIALOG_ID"]
+        bracket_pos = raw_key.find("[")
+        if bracket_pos == -1:
+            result[raw_key] = value
+            continue
+
+        root = raw_key[:bracket_pos]
+        parts = key_re.findall(raw_key)
+
+        cur: Any = result
+        keys = [root, *parts]
+        for i, k in enumerate(keys[:-1]):
+            if k not in cur or not isinstance(cur[k], dict):
+                cur[k] = {}
+            cur = cur[k]
+        cur[keys[-1]] = value
+
+    return result
+
+
 @app.post("/b24/imbot/events")
 async def b24_imbot_events(
-    payload: Dict[str, Any],
+    request: Request,
     settings: Settings = Depends(settings_dep),
     bitrix: BitrixClient = Depends(bitrix_dep),
 ) -> Dict[str, str]:
     """Receive events from Bitrix for the UI-registered bot.
 
-    Echoes incoming message text back to the same dialog via ``im.message.add``.
+    Bitrix sends bot events as **form-encoded** POST
+    (``application/x-www-form-urlencoded``), not JSON.
+
+    Echoes incoming message text back via ``imbot.message.add``.
     """
+    content_type = request.headers.get("content-type", "")
+
+    if "json" in content_type:
+        payload: Dict[str, Any] = await request.json()
+    else:
+        # form-encoded (the normal Bitrix bot event format)
+        raw_form = await request.form()
+        payload = _parse_nested_form(dict(raw_form))
+
     log.info("imbot_event_received", extra={"payload": payload})
 
-    # Typical event payload: data.PARAMS.DIALOG_ID + data.PARAMS.MESSAGE
+    event = payload.get("event", "")
+
+    # Extract params — Bitrix nests them under data.PARAMS
     data = payload.get("data") if isinstance(payload, dict) else None
     params = data.get("PARAMS") if isinstance(data, dict) else None
 
     dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
     message = params.get("MESSAGE") if isinstance(params, dict) else None
+
+    # Bitrix also sends auth context — useful for logging
+    auth = payload.get("auth") if isinstance(payload, dict) else None
+
+    log.info(
+        "imbot_event_parsed",
+        extra={
+            "event": event,
+            "dialog_id": dialog_id,
+            "message": message,
+            "auth_application_token": (auth.get("application_token") if isinstance(auth, dict) else None),
+        },
+    )
 
     if not isinstance(dialog_id, str) or not dialog_id:
         log.info("imbot_event_ignored", extra={"reason": "no_dialog_id"})
@@ -130,11 +190,16 @@ async def b24_imbot_events(
         log.info("imbot_event_ignored", extra={"reason": "empty_message"})
         return {"ok": "true"}
 
-    # Echo reply
+    # Echo reply using imbot.message.add (requires BOT_ID + CLIENT_ID)
     try:
         resp = await bitrix.call(
-            "im.message.add",
-            {"DIALOG_ID": dialog_id, "MESSAGE": f"echo: {text}"},
+            "imbot.message.add",
+            {
+                "BOT_ID": settings.b24_imbot_id,
+                "CLIENT_ID": settings.b24_imbot_client_id,
+                "DIALOG_ID": dialog_id,
+                "MESSAGE": f"echo: {text}",
+            },
         )
         log.info("imbot_echo_ok", extra={"dialog_id": dialog_id, "response": resp.get("result")})
     except Exception as e:
