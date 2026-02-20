@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     b24_imbot_name: str = Field(default="Bitrix Bot", alias="B24_IMBOT_NAME")
     b24_imbot_client_id: str = Field(default="", alias="B24_IMBOT_CLIENT_ID")
 
+    # Inbound webhook URL for bot REST calls (avoids OAuth app mismatch).
+    # Create in Bitrix: Developer resources → Inbound webhook, with "im" scope.
+    # Example: https://b24-xxx.bitrix24.ru/rest/1/abc123/
+    b24_webhook_url: str = Field(default="", alias="B24_WEBHOOK_URL")
+
     @property
     def b24_imbot_event_handler(self) -> str:
         return f"https://{self.public_domain}/b24/imbot/events"

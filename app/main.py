@@ -191,17 +191,24 @@ async def b24_imbot_events(
             log.info("imbot_event_ignored", extra={"reason": "empty_message"})
             return {"ok": "true"}
 
-        # Echo reply using imbot.message.add (requires BOT_ID + CLIENT_ID)
+        # Echo reply using imbot.message.add
+        # Prefer webhook URL (avoids OAuth app ≠ bot app mismatch).
+        # Falls back to OAuth call() if no webhook configured.
+        echo_params = {
+            "BOT_ID": settings.b24_imbot_id,
+            "CLIENT_ID": settings.b24_imbot_client_id,
+            "DIALOG_ID": dialog_id,
+            "MESSAGE": f"echo: {text}",
+        }
         try:
-            resp = await bitrix.call(
-                "imbot.message.add",
-                {
-                    "BOT_ID": settings.b24_imbot_id,
-                    "CLIENT_ID": settings.b24_imbot_client_id,
-                    "DIALOG_ID": dialog_id,
-                    "MESSAGE": f"echo: {text}",
-                },
-            )
+            if settings.b24_webhook_url:
+                resp = await bitrix.call_webhook(
+                    settings.b24_webhook_url,
+                    "imbot.message.add",
+                    echo_params,
+                )
+            else:
+                resp = await bitrix.call("imbot.message.add", echo_params)
             log.info("imbot_echo_ok", extra={"dialog_id": dialog_id, "response": resp.get("result")})
         except Exception as e:
             log.warning("imbot_echo_failed", extra={"error": str(e), "dialog_id": dialog_id})
