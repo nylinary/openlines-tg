@@ -132,6 +132,69 @@ def _parse_nested_form(form: Dict[str, str]) -> Dict[str, Any]:
     return result
 
 
+async def _call_b24(
+    bitrix: BitrixClient,
+    settings: Settings,
+    method: str,
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Call a Bitrix REST method via webhook (preferred) or OAuth fallback."""
+    if settings.b24_webhook_url:
+        return await bitrix.call_webhook(settings.b24_webhook_url, method, params)
+    return await bitrix.call(method, params)
+
+
+async def _send_bot_message(
+    bitrix: BitrixClient,
+    settings: Settings,
+    dialog_id: str,
+    text: str,
+) -> None:
+    """Send a message from the bot to a dialog."""
+    try:
+        resp = await _call_b24(bitrix, settings, "imbot.message.add", {
+            "BOT_ID": settings.b24_imbot_id,
+            "CLIENT_ID": settings.b24_imbot_client_id,
+            "DIALOG_ID": dialog_id,
+            "MESSAGE": text,
+        })
+        log.info("imbot_msg_ok", extra={"dialog_id": dialog_id, "response": resp.get("result")})
+    except Exception as e:
+        log.warning("imbot_msg_failed", extra={"error": str(e), "dialog_id": dialog_id})
+
+
+async def _transfer_to_operator(
+    bitrix: BitrixClient,
+    settings: Settings,
+    dialog_id: str,
+    chat_id: Optional[str],
+) -> None:
+    """Transfer the conversation to a free human operator.
+
+    Uses ``imopenlines.bot.session.operator`` which requires ``CHAT_ID``
+    (the internal openlines chat id, sent by Bitrix as ``TO_CHAT_ID``).
+    """
+    if not chat_id:
+        log.warning("transfer_no_chat_id", extra={"dialog_id": dialog_id})
+        await _send_bot_message(bitrix, settings, dialog_id,
+                                "Не удалось перевести на оператора — отсутствует идентификатор чата.")
+        return
+
+    # Notify user first
+    await _send_bot_message(bitrix, settings, dialog_id,
+                            "Перевожу вас на оператора, подождите...")
+
+    try:
+        resp = await _call_b24(bitrix, settings, "imopenlines.bot.session.operator", {
+            "CHAT_ID": chat_id,
+        })
+        log.info("transfer_to_operator_ok", extra={"chat_id": chat_id, "response": resp.get("result")})
+    except Exception as e:
+        log.warning("transfer_to_operator_failed", extra={"error": str(e), "chat_id": chat_id})
+        await _send_bot_message(bitrix, settings, dialog_id,
+                                "Не удалось перевести на оператора. Попробуйте позже.")
+
+
 @app.post("/b24/imbot/events")
 async def b24_imbot_events(
     request: Request,
@@ -165,6 +228,7 @@ async def b24_imbot_events(
 
         dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
         message = params.get("MESSAGE") if isinstance(params, dict) else None
+        chat_id = params.get("TO_CHAT_ID") if isinstance(params, dict) else None
 
         # Bitrix also sends auth context — useful for logging
         auth = payload.get("auth") if isinstance(payload, dict) else None
@@ -174,6 +238,7 @@ async def b24_imbot_events(
             extra={
                 "event": event,
                 "dialog_id": dialog_id,
+                "chat_id": chat_id,
                 "msg_text": message,
                 "auth_application_token": (auth.get("application_token") if isinstance(auth, dict) else None),
             },
@@ -191,27 +256,13 @@ async def b24_imbot_events(
             log.info("imbot_event_ignored", extra={"reason": "empty_message"})
             return {"ok": "true"}
 
-        # Echo reply using imbot.message.add
-        # Prefer webhook URL (avoids OAuth app ≠ bot app mismatch).
-        # Falls back to OAuth call() if no webhook configured.
-        echo_params = {
-            "BOT_ID": settings.b24_imbot_id,
-            "CLIENT_ID": settings.b24_imbot_client_id,
-            "DIALOG_ID": dialog_id,
-            "MESSAGE": f"echo: {text}",
-        }
-        try:
-            if settings.b24_webhook_url:
-                resp = await bitrix.call_webhook(
-                    settings.b24_webhook_url,
-                    "imbot.message.add",
-                    echo_params,
-                )
-            else:
-                resp = await bitrix.call("imbot.message.add", echo_params)
-            log.info("imbot_echo_ok", extra={"dialog_id": dialog_id, "response": resp.get("result")})
-        except Exception as e:
-            log.warning("imbot_echo_failed", extra={"error": str(e), "dialog_id": dialog_id})
+        # --- keyword: "оператор" → transfer to a live operator ---
+        if text.lower() in ("оператор", "operator"):
+            await _transfer_to_operator(bitrix, settings, dialog_id, chat_id)
+            return {"ok": "true"}
+
+        # --- default: echo reply ---
+        await _send_bot_message(bitrix, settings, dialog_id, f"echo: {text}")
 
     except Exception as e:
         log.exception("imbot_event_handler_error", extra={"error": str(e)})
