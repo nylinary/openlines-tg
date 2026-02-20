@@ -145,65 +145,69 @@ async def b24_imbot_events(
 
     Echoes incoming message text back via ``imbot.message.add``.
     """
-    content_type = request.headers.get("content-type", "")
-
-    if "json" in content_type:
-        payload: Dict[str, Any] = await request.json()
-    else:
-        # form-encoded (the normal Bitrix bot event format)
-        raw_form = await request.form()
-        payload = _parse_nested_form(dict(raw_form))
-
-    log.info("imbot_event_received", extra={"payload": payload})
-
-    event = payload.get("event", "")
-
-    # Extract params — Bitrix nests them under data.PARAMS
-    data = payload.get("data") if isinstance(payload, dict) else None
-    params = data.get("PARAMS") if isinstance(data, dict) else None
-
-    dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
-    message = params.get("MESSAGE") if isinstance(params, dict) else None
-
-    # Bitrix also sends auth context — useful for logging
-    auth = payload.get("auth") if isinstance(payload, dict) else None
-
-    log.info(
-        "imbot_event_parsed",
-        extra={
-            "event": event,
-            "dialog_id": dialog_id,
-            "message": message,
-            "auth_application_token": (auth.get("application_token") if isinstance(auth, dict) else None),
-        },
-    )
-
-    if not isinstance(dialog_id, str) or not dialog_id:
-        log.info("imbot_event_ignored", extra={"reason": "no_dialog_id"})
-        return {"ok": "true"}
-
-    if not isinstance(message, str):
-        message = ""
-
-    text = message.strip()
-    if not text:
-        log.info("imbot_event_ignored", extra={"reason": "empty_message"})
-        return {"ok": "true"}
-
-    # Echo reply using imbot.message.add (requires BOT_ID + CLIENT_ID)
     try:
-        resp = await bitrix.call(
-            "imbot.message.add",
-            {
-                "BOT_ID": settings.b24_imbot_id,
-                "CLIENT_ID": settings.b24_imbot_client_id,
-                "DIALOG_ID": dialog_id,
-                "MESSAGE": f"echo: {text}",
+        content_type = request.headers.get("content-type", "")
+
+        if "json" in content_type:
+            payload: Dict[str, Any] = await request.json()
+        else:
+            # form-encoded (the normal Bitrix bot event format)
+            raw_form = await request.form()
+            payload = _parse_nested_form(dict(raw_form))
+
+        log.info("imbot_event_received", extra={"payload": payload})
+
+        event = payload.get("event", "")
+
+        # Extract params — Bitrix nests them under data.PARAMS
+        data = payload.get("data") if isinstance(payload, dict) else None
+        params = data.get("PARAMS") if isinstance(data, dict) else None
+
+        dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
+        message = params.get("MESSAGE") if isinstance(params, dict) else None
+
+        # Bitrix also sends auth context — useful for logging
+        auth = payload.get("auth") if isinstance(payload, dict) else None
+
+        log.info(
+            "imbot_event_parsed",
+            extra={
+                "event": event,
+                "dialog_id": dialog_id,
+                "message": message,
+                "auth_application_token": (auth.get("application_token") if isinstance(auth, dict) else None),
             },
         )
-        log.info("imbot_echo_ok", extra={"dialog_id": dialog_id, "response": resp.get("result")})
+
+        if not isinstance(dialog_id, str) or not dialog_id:
+            log.info("imbot_event_ignored", extra={"reason": "no_dialog_id"})
+            return {"ok": "true"}
+
+        if not isinstance(message, str):
+            message = ""
+
+        text = message.strip()
+        if not text:
+            log.info("imbot_event_ignored", extra={"reason": "empty_message"})
+            return {"ok": "true"}
+
+        # Echo reply using imbot.message.add (requires BOT_ID + CLIENT_ID)
+        try:
+            resp = await bitrix.call(
+                "imbot.message.add",
+                {
+                    "BOT_ID": settings.b24_imbot_id,
+                    "CLIENT_ID": settings.b24_imbot_client_id,
+                    "DIALOG_ID": dialog_id,
+                    "MESSAGE": f"echo: {text}",
+                },
+            )
+            log.info("imbot_echo_ok", extra={"dialog_id": dialog_id, "response": resp.get("result")})
+        except Exception as e:
+            log.warning("imbot_echo_failed", extra={"error": str(e), "dialog_id": dialog_id})
+
     except Exception as e:
-        log.warning("imbot_echo_failed", extra={"error": str(e), "dialog_id": dialog_id})
+        log.exception("imbot_event_handler_error", extra={"error": str(e)})
 
     return {"ok": "true"}
 
