@@ -23,20 +23,6 @@ class Storage:
         # SET key value NX EX ttl
         return bool(await self._redis.set(key, "1", nx=True, ex=ttl_s))
 
-    # --- mappings ---
-
-    async def map_external_to_tg_chat(self, external_chat_id: str, tg_chat_id: str) -> None:
-        await self._redis.hset("map:external_chat_to_tg", external_chat_id, tg_chat_id)
-
-    async def get_tg_chat_by_external_chat(self, external_chat_id: str) -> Optional[str]:
-        return await self._redis.hget("map:external_chat_to_tg", external_chat_id)
-
-    async def map_tg_chat_to_external_chat(self, tg_chat_id: str, external_chat_id: str) -> None:
-        await self._redis.hset("map:tg_chat_to_external", tg_chat_id, external_chat_id)
-
-    async def get_external_chat_by_tg_chat(self, tg_chat_id: str) -> Optional[str]:
-        return await self._redis.hget("map:tg_chat_to_external", tg_chat_id)
-
     # --- Bitrix OAuth token storage ---
 
     async def set_b24_tokens(self, *, access_token: str, refresh_token: str, expires_in: int) -> None:

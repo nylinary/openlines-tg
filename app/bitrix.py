@@ -46,7 +46,6 @@ class BitrixClient:
         storage: Storage,
         timeout_s: float = 10.0,
         retries: int = 3,
-        connector_hash: str = "",
     ):
         self.domain = domain.strip().replace("https://", "").replace("http://", "").rstrip("/")
         self.client_id = client_id
@@ -55,7 +54,6 @@ class BitrixClient:
         self.storage = storage
         self.timeout_s = timeout_s
         self.retries = retries
-        self.connector_hash = connector_hash
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s))
 
     async def close(self) -> None:
@@ -203,139 +201,3 @@ class BitrixClient:
                 await asyncio.sleep(sleep_s)
 
         raise BitrixError(f"Bitrix call failed after retries: {method}: {last_err}")
-
-    async def register(self, connector: str) -> Dict[str, Any]:
-        """Register connector (best-effort).
-
-        Some portals deny custom provider registration for local apps and return
-        CONNECTOR_ID_REQUIRED, while still allowing activate/status/send.messages
-        when the connector code is already configured on the portal.
-
-        In that case, we treat it as non-fatal and let runtime calls decide.
-        """
-        try:
-            return await self.call(
-                "imconnector.register",
-                {
-                    "CONNECTOR": connector,
-                    "NAME": connector,
-                },
-            )
-        except BitrixError as e:
-            msg = str(e)
-            if "CONNECTOR_ID_REQUIRED" in msg or "ID коннектора" in msg:
-                log.warning("bitrix_register_skipped", extra={"reason": msg, "connector": connector})
-                return {"error": "register_skipped", "error_description": msg}
-            raise
-
-    async def activate(self, connector: str, line_id: str) -> Dict[str, Any]:
-        return await self.call(
-            "imconnector.activate",
-            {
-                "CONNECTOR": connector,
-                "LINE": line_id,
-                "ACTIVE": "Y",
-            },
-        )
-
-    async def status(self, connector: str, line_id: str) -> Dict[str, Any]:
-        return await self.call(
-            "imconnector.status",
-            {
-                "CONNECTOR": connector,
-                "LINE": line_id,
-            },
-        )
-
-    async def send_messages(self, connector: str, line_id: str, messages: list[Dict[str, Any]]) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "CONNECTOR": connector,
-            "LINE": line_id,
-            **_encode_messages(messages),
-        }
-        if self.connector_hash:
-            payload["HASH"] = self.connector_hash
-        return await self.call("imconnector.send.messages", payload)
-
-    async def send_status_delivery(self, connector: str, line_id: str, chat_id: str, message_id: str) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "CONNECTOR": connector,
-            "LINE": line_id,
-            "CHAT_ID": chat_id,
-            "MESSAGE_ID": message_id,
-        }
-        if self.connector_hash:
-            payload["HASH"] = self.connector_hash
-        return await self.call("imconnector.send.status.delivery", payload)
-
-    async def send_status_reading(self, connector: str, line_id: str, chat_id: str, message_id: str) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "CONNECTOR": connector,
-            "LINE": line_id,
-            "CHAT_ID": chat_id,
-            "MESSAGE_ID": message_id,
-        }
-        if self.connector_hash:
-            payload["HASH"] = self.connector_hash
-        return await self.call("imconnector.send.status.reading", payload)
-
-    async def imbot_register(
-        self,
-        *,
-        code: str,
-        name: str,
-        event_handler: str,
-        openline: str = "Y",
-    ) -> Dict[str, Any]:
-        safe_name = (name or "").strip() or code
-        payload: Dict[str, Any] = {
-            "CODE": code,
-            "TYPE": "B",
-            "EVENT_HANDLER": event_handler,
-            "OPENLINE": openline,
-            "PROPERTIES": {
-                "NAME": safe_name,
-                "LAST_NAME": "",
-                "COLOR": "AQUA",
-            },
-        }
-        # imbot.register frequently expects JSON and works reliably with Bearer auth
-        return await self.call("imbot.register", payload, use_bearer=True, json_body=True)
-
-    async def imbot_update(self, *, bot_id: str, name: Optional[str] = None, event_handler: Optional[str] = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"BOT_ID": bot_id}
-        props: Dict[str, Any] = {}
-        if name is not None:
-            props["NAME"] = name
-        if event_handler is not None:
-            payload["EVENT_HANDLER"] = event_handler
-        if props:
-            payload["PROPERTIES"] = props
-        return await self.call("imbot.update", payload, use_bearer=True, json_body=True)
-
-
-def _encode_messages(messages: list[Dict[str, Any]]) -> Dict[str, Any]:
-    """Encode MESSAGES[] to x-www-form-urlencoded style keys.
-
-    Bitrix endpoints often expect fields like:
-      MESSAGES[0][user][id]=...
-      MESSAGES[0][chat][id]=...
-      MESSAGES[0][message][id]=...
-      MESSAGES[0][message][text]=...
-
-    This encoder handles dict nesting.
-    """
-
-    def walk(prefix: str, obj: Any, out: Dict[str, Any]) -> None:
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                walk(f"{prefix}[{k}]", v, out)
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                walk(f"{prefix}[{i}]", v, out)
-        else:
-            out[prefix] = "" if obj is None else str(obj)
-
-    out: Dict[str, Any] = {}
-    walk("MESSAGES", messages, out)
-    return out
