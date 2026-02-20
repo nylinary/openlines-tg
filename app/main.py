@@ -174,7 +174,7 @@ async def b24_imbot_events(
             extra={
                 "event": event,
                 "dialog_id": dialog_id,
-                "message": message,
+                "msg_text": message,
                 "auth_application_token": (auth.get("application_token") if isinstance(auth, dict) else None),
             },
         )
