@@ -27,27 +27,7 @@ from .models import Base, ChatMessage, Product, ScrapeMeta
 
 log = logging.getLogger("app.database")
 
-# FTS trigger DDL — executed once after table creation.
-# SQLAlchemy doesn't natively support PG triggers, so we apply this via raw DDL.
-_FTS_TRIGGER_SQL = """\
-CREATE OR REPLACE FUNCTION products_fts_update() RETURNS trigger AS $$
-BEGIN
-    NEW.fts :=
-        setweight(to_tsvector('russian', coalesce(NEW.title, '')), 'A') ||
-        setweight(to_tsvector('russian', coalesce(NEW.descr, '')), 'B') ||
-        setweight(to_tsvector('russian', coalesce(NEW.text, '')), 'C') ||
-        setweight(to_tsvector('russian', coalesce(NEW.category, '')), 'D');
-    NEW.updated_at := now();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_products_fts ON products;
-CREATE TRIGGER trg_products_fts
-    BEFORE INSERT OR UPDATE ON products
-    FOR EACH ROW EXECUTE FUNCTION products_fts_update();
-"""
-
+# Seed the single-row scrape_meta table.
 _SEED_SCRAPE_META_SQL = """\
 INSERT INTO scrape_meta (id) VALUES (1) ON CONFLICT DO NOTHING;
 """
@@ -78,10 +58,9 @@ class Database:
         )
 
     async def connect(self) -> None:
-        """Create tables (if needed) and install FTS trigger."""
+        """Create tables (if needed) and seed metadata row."""
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(text(_FTS_TRIGGER_SQL))
             await conn.execute(text(_SEED_SCRAPE_META_SQL))
         log.info("pg_connected_and_migrated", extra={"dsn": _mask_dsn(self._dsn)})
 

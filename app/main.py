@@ -90,7 +90,7 @@ async def _startup() -> None:
         log.warning("bitrix_oauth_not_installed", extra={"hint": "open /b24/install to authorize app"})
 
     # --- Background scraper task ---
-    # app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
+    app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
 
     log.info(
         "startup_complete",
