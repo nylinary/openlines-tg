@@ -308,15 +308,17 @@ class ProductCatalog:
     async def _save_to_db_full(self) -> None:
         """Replace all products in PostgreSQL and update scrape metadata."""
         if not self._db:
+            log.warning("catalog_db_save_skipped_no_db")
             return
         try:
-            await self._db.replace_all_products(self.products)
+            count = await self._db.replace_all_products(self.products)
             await self._db.set_scrape_meta(
                 last_full_scrape=self.last_full_scrape,
                 last_price_refresh=self.last_price_refresh,
             )
-        except Exception as e:
-            log.warning("catalog_db_save_error", extra={"error": str(e)})
+            log.info("catalog_db_save_ok", extra={"count": count})
+        except Exception:
+            log.exception("catalog_db_save_error")
 
     async def _save_to_db_prices(self) -> None:
         """Update prices in PostgreSQL and refresh metadata."""
@@ -327,8 +329,8 @@ class ProductCatalog:
             await self._db.set_scrape_meta(
                 last_price_refresh=self.last_price_refresh,
             )
-        except Exception as e:
-            log.warning("catalog_db_price_save_error", extra={"error": str(e)})
+        except Exception:
+            log.exception("catalog_db_price_save_error")
 
     # --- Scraping ---
 
@@ -361,10 +363,11 @@ class ProductCatalog:
                     raw_products = await _fetch_products(client, sp_uid, rec_id)
                     for rp in raw_products:
                         uid = rp.get("uid", "")
-                        if uid and uid in seen_uids:
+                        if not uid:
                             continue
-                        if uid:
-                            seen_uids.add(uid)
+                        if uid in seen_uids:
+                            continue
+                        seen_uids.add(uid)
                         product = _normalise_product(rp, slug)
                         all_products.append(product)
                         category_count += 1

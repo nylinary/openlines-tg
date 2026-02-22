@@ -138,13 +138,17 @@ async def _scraper_loop(settings: Settings, catalog: ProductCatalog) -> None:
     try:
         if not catalog.products:
             log.info("scraper_initial_full_scrape")
-            await catalog.full_scrape()
+            count = await catalog.full_scrape()
+            log.info("scraper_initial_full_scrape_done", extra={
+                "scraped": count,
+                "in_memory": len(catalog.products),
+            })
             # Invalidate AI prompt cache after scrape
             ai_chat = getattr(app.state, "ai_chat", None)
             if ai_chat:
                 ai_chat.invalidate_system_prompt_cache()
-    except Exception as e:
-        log.error("scraper_initial_error", extra={"error": str(e)})
+    except Exception:
+        log.exception("scraper_initial_error")
 
     while True:
         try:

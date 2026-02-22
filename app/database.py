@@ -95,12 +95,26 @@ class Database:
         return len(products)
 
     async def replace_all_products(self, products: List[Dict[str, Any]]) -> int:
-        """Replace the entire products table (used after full scrape)."""
+        """Replace the entire products table (used after full scrape).
+
+        Uses a two-step approach: DELETE all, then bulk-INSERT.
+        Products are inserted in batches to avoid excessively large
+        statements and to surface per-batch errors.
+        """
+        if not products:
+            return 0
+
+        BATCH = 50
+        rows = [_product_dict_to_row(p) for p in products]
+
         async with self._session_factory() as session:
             async with session.begin():
                 await session.execute(delete(Product))
-                for p in products:
-                    session.add(Product(**_product_dict_to_row(p)))
+
+                for i in range(0, len(rows), BATCH):
+                    batch = rows[i : i + BATCH]
+                    stmt = pg_insert(Product).values(batch)
+                    await session.execute(stmt)
 
         log.info("pg_products_replaced", extra={"count": len(products)})
         return len(products)
