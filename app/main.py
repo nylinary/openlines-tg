@@ -70,7 +70,7 @@ async def _startup() -> None:
             base_url=settings.openai_base_url,
             temperature=settings.llm_temperature,
             max_tokens=settings.llm_max_tokens,
-            timeout_s=settings.http_timeout_s,
+            timeout_s=settings.llm_timeout_s,
         )
         app.state.llm_provider = llm
         app.state.ai_chat = AIChatHandler(

@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     # HTTP
     http_timeout_s: float = Field(default=10.0, alias="HTTP_TIMEOUT_S")
     http_retries: int = Field(default=3, alias="HTTP_RETRIES")
+    llm_timeout_s: float = Field(default=60.0, alias="LLM_TIMEOUT_S")
 
 
 def get_settings() -> Settings:
