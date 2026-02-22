@@ -372,7 +372,7 @@ class ProductCatalog:
                 for sp_uid, rec_id in pairs:
                     raw_products = await _fetch_products(client, sp_uid, rec_id)
                     for rp in raw_products:
-                        uid = rp.get("uid", "")
+                        uid = str(rp.get("uid", ""))
                         if not uid:
                             continue
                         if uid in seen_uids:
@@ -421,11 +421,13 @@ class ProductCatalog:
                 for sp_uid, rec_id in pairs:
                     raw_products = await _fetch_products(client, sp_uid, rec_id)
                     for rp in raw_products:
-                        uid = rp.get("uid", "")
+                        uid = str(rp.get("uid", ""))
+                        if not uid:
+                            continue
                         if uid in by_uid:
-                            by_uid[uid]["price"] = rp.get("price", by_uid[uid]["price"])
-                            by_uid[uid]["priceold"] = rp.get("priceold", by_uid[uid]["priceold"])
-                            by_uid[uid]["quantity"] = rp.get("quantity", by_uid[uid]["quantity"])
+                            by_uid[uid]["price"] = str(rp.get("price", by_uid[uid]["price"]))
+                            by_uid[uid]["priceold"] = str(rp.get("priceold", by_uid[uid]["priceold"]))
+                            by_uid[uid]["quantity"] = str(rp.get("quantity", by_uid[uid]["quantity"]))
                             updated += 1
                         else:
                             # New product appeared — add it
