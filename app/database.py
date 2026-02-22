@@ -277,23 +277,32 @@ class Database:
 # ---------------------------------------------------------------------------
 
 def _product_dict_to_row(p: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert a catalog product dict to a flat dict for SQLAlchemy insert."""
+    """Convert a catalog product dict to a flat dict for SQLAlchemy insert.
+
+    All Text columns are explicitly cast to ``str`` because the Tilda API
+    sometimes returns numeric values (e.g. ``uid`` as ``int``, ``portion``
+    as ``int``) which asyncpg rejects for VARCHAR parameters.
+    """
+    def _s(key: str, default: str = "") -> str:
+        v = p.get(key, default)
+        return str(v) if v is not None else default
+
     return {
-        "uid": p.get("uid", ""),
-        "title": p.get("title", ""),
-        "sku": p.get("sku", ""),
-        "text": p.get("text", ""),
-        "descr": p.get("descr", ""),
-        "price": p.get("price", ""),
-        "priceold": p.get("priceold", ""),
-        "quantity": p.get("quantity", ""),
-        "portion": p.get("portion", ""),
-        "unit": p.get("unit", ""),
-        "mark": p.get("mark", ""),
-        "url": p.get("url", ""),
+        "uid": _s("uid"),
+        "title": _s("title"),
+        "sku": _s("sku"),
+        "text": _s("text"),
+        "descr": _s("descr"),
+        "price": _s("price"),
+        "priceold": _s("priceold"),
+        "quantity": _s("quantity"),
+        "portion": _s("portion"),
+        "unit": _s("unit"),
+        "mark": _s("mark"),
+        "url": _s("url"),
         "editions": p.get("editions", []),
         "characteristics": p.get("characteristics", []),
-        "category": p.get("category", ""),
+        "category": _s("category"),
     }
 
 

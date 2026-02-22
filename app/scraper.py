@@ -175,17 +175,27 @@ async def _fetch_products(
 # ---------------------------------------------------------------------------
 
 def _normalise_product(raw: Dict[str, Any], category_slug: str) -> Dict[str, Any]:
-    """Normalise a Tilda product dict into a cleaner structure."""
+    """Normalise a Tilda product dict into a cleaner structure.
+
+    All scalar values are coerced to ``str`` because the Tilda API
+    sometimes returns numeric types (e.g. ``uid`` as ``int``,
+    ``portion`` as ``int``).
+    """
+
+    def _s(key: str, default: str = "") -> str:
+        v = raw.get(key, default)
+        return str(v) if v is not None else default
+
     editions: List[Dict[str, Any]] = []
     for ed in raw.get("editions", []):
         if isinstance(ed, dict):
             editions.append({
-                "uid": ed.get("uid", ""),
-                "price": ed.get("price", ""),
-                "priceold": ed.get("priceold", ""),
-                "sku": ed.get("sku", ""),
-                "text": ed.get("text", ""),
-                "quantity": ed.get("quantity", ""),
+                "uid": str(ed.get("uid", "")),
+                "price": str(ed.get("price", "")),
+                "priceold": str(ed.get("priceold", "")),
+                "sku": str(ed.get("sku", "")),
+                "text": str(ed.get("text", "")),
+                "quantity": str(ed.get("quantity", "")),
             })
 
     characteristics: List[Dict[str, str]] = []
@@ -197,18 +207,18 @@ def _normalise_product(raw: Dict[str, Any], category_slug: str) -> Dict[str, Any
             })
 
     return {
-        "uid": raw.get("uid", ""),
-        "title": raw.get("title", ""),
-        "sku": raw.get("sku", ""),
-        "text": raw.get("text", ""),
-        "descr": raw.get("descr", ""),
-        "price": raw.get("price", ""),
-        "priceold": raw.get("priceold", ""),
-        "quantity": raw.get("quantity", ""),
-        "portion": raw.get("portion", ""),
-        "unit": raw.get("unit", ""),
-        "mark": raw.get("mark", ""),
-        "url": raw.get("url", ""),
+        "uid": _s("uid"),
+        "title": _s("title"),
+        "sku": _s("sku"),
+        "text": _s("text"),
+        "descr": _s("descr"),
+        "price": _s("price"),
+        "priceold": _s("priceold"),
+        "quantity": _s("quantity"),
+        "portion": _s("portion"),
+        "unit": _s("unit"),
+        "mark": _s("mark"),
+        "url": _s("url"),
         # gallery (image URLs) intentionally excluded — Bitrix IM chat
         # only supports plain text, so images cannot be displayed inline.
         # Product page URLs are included and customers can see photos there.
