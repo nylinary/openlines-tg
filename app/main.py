@@ -395,7 +395,8 @@ async def _extract_voice_text(
 
     Bitrix sends file attachments in ONIMBOTMESSAGEADD under the PARAMS
     as ``FILES`` — a dict mapping file indices to file info dicts, each
-    containing ``type``, ``name``, ``link``, ``size``, etc.
+    containing ``type``, ``name``, ``urlDownload``, ``size``,
+    ``viewerAttrs`` (with ``viewerType``), etc.
 
     If no voice file is found, returns None.
     If transcription succeeds, returns the transcribed text.
@@ -405,7 +406,7 @@ async def _extract_voice_text(
     if not stt:
         return None
 
-    # Bitrix sends FILES as a nested dict: FILES[0][name], FILES[0][link], etc.
+    # Bitrix sends FILES as a nested dict: FILES[id][name], FILES[id][urlDownload], etc.
     files_raw = params.get("FILES")
     if not files_raw or not isinstance(files_raw, dict):
         return None
@@ -415,24 +416,29 @@ async def _extract_voice_text(
     voice_name: str = "voice.ogg"
     voice_mime: str = ""
 
-    # files_raw can be {"0": {"name": ..., "link": ..., "type": ...}, "1": {...}}
+    # files_raw can be {"0": {"name": ..., "urlDownload": ..., "type": ...}, "1": {...}}
     file_entries = files_raw.values() if isinstance(files_raw, dict) else []
     for f in file_entries:
         if not isinstance(f, dict):
             continue
         fname = str(f.get("name", "") or "")
         ftype = str(f.get("type", "") or "")
-        flink = str(f.get("link", "") or "")
+        # Bitrix uses urlDownload / urlShow, not "link"
+        flink = str(f.get("urlDownload", "") or f.get("urlShow", "") or f.get("link", "") or "")
+        # Bitrix includes viewerAttrs.viewerType == "audio" for voice/audio
+        viewer_attrs = f.get("viewerAttrs") or {}
+        viewer_type = str(viewer_attrs.get("viewerType", "") or "") if isinstance(viewer_attrs, dict) else ""
 
         log.info("voice_file_candidate", extra={
             "dialog_id": dialog_id,
             "message_id": message_id,
-            "filename": fname,
+            "file_name": fname,
             "mime_type": ftype,
+            "viewer_type": viewer_type,
             "link": flink[:100] if flink else "",
         })
 
-        if is_voice_file(mime_type=ftype, filename=fname):
+        if is_voice_file(mime_type=ftype, filename=fname, viewer_type=viewer_type):
             voice_url = flink
             voice_name = fname or "voice.ogg"
             voice_mime = ftype
@@ -444,7 +450,7 @@ async def _extract_voice_text(
     log.info("voice_message_detected", extra={
         "dialog_id": dialog_id,
         "message_id": message_id,
-        "filename": voice_name,
+        "file_name": voice_name,
         "mime_type": voice_mime,
         "url": voice_url[:100],
     })
@@ -467,7 +473,7 @@ async def _extract_voice_text(
     log.info("voice_downloaded", extra={
         "dialog_id": dialog_id,
         "size_bytes": len(audio_bytes),
-        "filename": voice_name,
+        "file_name": voice_name,
     })
 
     # Transcribe via Whisper

@@ -40,7 +40,7 @@ VOICE_MIME_TYPES = frozenset({
 
 # File extensions that are likely voice/audio
 VOICE_EXTENSIONS = frozenset({
-    ".ogg", ".mp3", ".wav", ".m4a", ".webm", ".opus",
+    ".ogg", ".oga", ".mp3", ".wav", ".m4a", ".webm", ".opus",
     ".mp4", ".mpeg", ".mpga", ".aac", ".wma", ".flac",
 })
 
@@ -100,7 +100,7 @@ class SpeechToText:
             )
 
         log.info("stt_request", extra={
-            "filename": filename,
+            "file_name": filename,
             "size_bytes": len(audio_bytes),
             "language": language,
             "model": self.model,
@@ -149,8 +149,12 @@ class SpeechToText:
         return text
 
 
-def is_voice_file(*, mime_type: str = "", filename: str = "") -> bool:
-    """Check if a file looks like a voice/audio message by MIME or extension."""
+def is_voice_file(*, mime_type: str = "", filename: str = "", viewer_type: str = "") -> bool:
+    """Check if a file looks like a voice/audio message by MIME, extension, or Bitrix viewerType."""
+    # Bitrix sends viewerAttrs.viewerType == "audio" for voice messages
+    if viewer_type.lower().strip() == "audio":
+        return True
+
     mime = mime_type.lower().strip()
     if mime and mime in VOICE_MIME_TYPES:
         return True
