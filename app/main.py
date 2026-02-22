@@ -186,18 +186,16 @@ async def _scraper_loop(settings: Settings, catalog: ProductCatalog) -> None:
 
 
 async def _session_watchdog(settings: Settings) -> None:
-    """Background safety-net: monitor sessions and detect operator closures.
+    """Background safety-net: auto-close orphaned transferred sessions.
 
-    Two strategies combined:
-
-    **Strategy A — Redis-based** (fast, event-driven):
     Scans sessions marked as ``transferred`` in Redis.  When a transferred
-    session has been idle for >2 minutes (operator likely closed it), marks
-    it as ``closed``.  The next ``ONIMBOTJOINCHAT`` event will clear history.
+    session has been idle for >2 minutes (operator likely closed it or
+    we missed the ONIMBOTDELETE event), marks it as ``closed``.
+    The next ``ONIMBOTJOINCHAT`` event will clear history and start fresh.
 
-    **Strategy B — Bitrix API polling** (slower, catches edge cases):
-    Calls ``imopenlines.session.list`` to find sessions that Bitrix considers
-    closed but where our bot is not assigned.  Logs them for diagnostics.
+    Note: ``imopenlines.session.list`` does NOT exist in Bitrix24 REST API,
+    so we rely solely on Redis state + bot lifecycle events
+    (ONIMBOTJOINCHAT / ONIMBOTDELETE) for session tracking.
 
     Interval: every 2 minutes.
     """
@@ -206,10 +204,7 @@ async def _session_watchdog(settings: Settings) -> None:
     while True:
         try:
             storage: Storage = app.state.storage
-            bitrix: BitrixClient = app.state.bitrix
-            bot_id = settings.b24_imbot_id
 
-            # --- Strategy A: check transferred sessions in Redis ---
             import time as _t
             now = _t.time()
             tracked = await storage.get_all_tracked_sessions()
@@ -226,36 +221,6 @@ async def _session_watchdog(settings: Settings) -> None:
                         "chat_id": chat_id,
                         "age_s": round(now - ts),
                     })
-
-            # --- Strategy B: poll Bitrix imopenlines.session.list ---
-            try:
-                resp = await _call_b24(bitrix, settings, "imopenlines.session.list", {
-                    "LIMIT": 20,
-                })
-                sessions = resp.get("result", [])
-                if not isinstance(sessions, list):
-                    sessions = []
-
-                for s in sessions:
-                    if not isinstance(s, dict):
-                        continue
-                    status = str(s.get("STATUS", ""))
-                    operator_id = str(s.get("OPERATOR_ID", ""))
-                    s_chat_id = str(s.get("CHAT_ID", ""))
-                    session_id = str(s.get("ID", ""))
-
-                    # Closed session not assigned to our bot — log for diagnostics
-                    if status in ("closed", "finish", "0") and operator_id != str(bot_id):
-                        log.info("watchdog_orphaned_session", extra={
-                            "session_id": session_id,
-                            "chat_id": s_chat_id,
-                            "status": status,
-                            "operator_id": operator_id,
-                            "bot_id": bot_id,
-                        })
-            except Exception as e:
-                # imopenlines.session.list may not be available on all plans
-                log.debug("watchdog_api_error", extra={"error": str(e)})
 
         except asyncio.CancelledError:
             raise
