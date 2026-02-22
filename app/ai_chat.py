@@ -19,6 +19,32 @@ from .storage import Storage
 
 log = logging.getLogger("app.ai_chat")
 
+# ---------------------------------------------------------------------------
+# Markdown stripping — Bitrix IM doesn't render Markdown so we remove it
+# ---------------------------------------------------------------------------
+
+_RE_BOLD = re.compile(r"\*\*(.+?)\*\*")          # **bold**
+_RE_ITALIC_STAR = re.compile(r"\*(.+?)\*")        # *italic*
+_RE_ITALIC_UNDER = re.compile(r"(?<!\w)_(.+?)_(?!\w)")  # _italic_
+_RE_STRIKE = re.compile(r"~~(.+?)~~")             # ~~strike~~
+_RE_INLINE_CODE = re.compile(r"`(.+?)`")          # `code`
+_RE_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)   # ### heading
+_RE_LINK = re.compile(r"\[([^\]]+)]\(([^)]+)\)")  # [text](url)
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove Markdown formatting that Bitrix IM cannot render."""
+    text = _RE_BOLD.sub(r"\1", text)
+    text = _RE_ITALIC_STAR.sub(r"\1", text)
+    text = _RE_ITALIC_UNDER.sub(r"\1", text)
+    text = _RE_STRIKE.sub(r"\1", text)
+    text = _RE_INLINE_CODE.sub(r"\1", text)
+    text = _RE_HEADING.sub("", text)
+    # [text](url) → text (url)  — keep the URL visible
+    text = _RE_LINK.sub(r"\1 (\2)", text)
+    return text
+
+
 # Maximum history messages to include in the prompt (pairs of user+assistant)
 MAX_HISTORY_MESSAGES = 20
 
@@ -190,6 +216,9 @@ class AIChatHandler:
                 "Извините, произошла техническая ошибка. "
                 "Попробуйте ещё раз или напишите «оператор» для связи с менеджером."
             )
+
+        # 4b. Strip Markdown — GPT may still produce it despite the prompt
+        reply = _strip_markdown(reply)
 
         # 5. Save messages to history
         await self._save_message(dialog_id, "user", user_text)
