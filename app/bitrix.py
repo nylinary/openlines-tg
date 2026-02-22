@@ -59,6 +59,34 @@ class BitrixClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    # --- File downloads ---
+
+    async def download_file(self, url: str) -> bytes:
+        """Download a file by URL (e.g. Bitrix disk file link).
+
+        Bitrix file URLs may require auth.  If the URL is on the same
+        domain, an access token query param is appended automatically.
+        """
+        try:
+            # If it's a Bitrix domain URL, ensure auth token is present
+            if self.domain in url and "auth=" not in url:
+                try:
+                    token = await self.ensure_token()
+                    separator = "&" if "?" in url else "?"
+                    url = f"{url}{separator}auth={token}"
+                except Exception:
+                    pass  # try without auth
+
+            r = await self._client.get(url, follow_redirects=True)
+            r.raise_for_status()
+            return r.content
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as e:
+            log.error("bitrix_file_download_error", extra={
+                "url": _redact_bitrix_url(url),
+                "error": str(e),
+            })
+            raise BitrixError(f"File download failed: {e}") from e
+
     # --- OAuth ---
 
     def auth_url(self, *, state: str) -> str:

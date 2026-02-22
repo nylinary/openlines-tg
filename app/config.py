@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")  # custom endpoint (optional)
 
+    # Speech-to-text (voice message transcription via OpenAI Whisper)
+    stt_enabled: bool = Field(default=True, alias="STT_ENABLED")
+    stt_model: str = Field(default="whisper-1", alias="STT_MODEL")
+    stt_language: str = Field(default="ru", alias="STT_LANGUAGE")
+
     # Scraper schedule (seconds)
     scraper_full_interval_s: int = Field(default=86400, alias="SCRAPER_FULL_INTERVAL_S")  # daily
     scraper_price_interval_s: int = Field(default=3600, alias="SCRAPER_PRICE_INTERVAL_S")  # hourly

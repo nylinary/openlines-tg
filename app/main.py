@@ -8,12 +8,13 @@ from typing import Any, Dict, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from .ai_chat import AIChatHandler
-from .bitrix import BitrixClient, BitrixOAuthError
+from .bitrix import BitrixClient, BitrixError, BitrixOAuthError
 from .config import Settings, get_settings
 from .database import Database
 from .llm import LLMError, create_llm_provider
 from .logging import setup_logging
 from .scraper import ProductCatalog
+from .speech import SpeechToText, SpeechToTextError, is_voice_file
 from .storage import Storage
 
 log = logging.getLogger("app")
@@ -82,6 +83,21 @@ async def _startup() -> None:
     except (ValueError, LLMError) as e:
         log.warning("llm_provider_disabled", extra={"error": str(e), "hint": "check OPENAI_API_KEY and credentials"})
 
+    # --- Speech-to-text (voice message transcription) ---
+    app.state.stt = None  # Optional[SpeechToText]
+    if settings.stt_enabled and settings.openai_api_key:
+        try:
+            app.state.stt = SpeechToText(
+                api_key=settings.openai_api_key,
+                model=settings.stt_model,
+                timeout_s=settings.llm_timeout_s,
+            )
+            log.info("stt_enabled", extra={"model": settings.stt_model, "language": settings.stt_language})
+        except (ValueError, Exception) as e:
+            log.warning("stt_disabled", extra={"error": str(e)})
+    else:
+        log.info("stt_disabled", extra={"reason": "STT_ENABLED=false or no API key"})
+
     # Verify OAuth token is available (non-fatal)
     try:
         await app.state.bitrix.ensure_token()
@@ -102,6 +118,7 @@ async def _startup() -> None:
             "imbot_code": settings.b24_imbot_code,
             "event_handler": settings.b24_imbot_event_handler,
             "ai_enabled": app.state.ai_chat is not None,
+            "stt_enabled": app.state.stt is not None,
             "catalog_products": len(app.state.catalog.products),
         },
     )
@@ -119,7 +136,7 @@ async def _shutdown() -> None:
             except asyncio.CancelledError:
                 pass
 
-    for key in ("llm_provider", "bitrix", "storage", "db"):
+    for key in ("llm_provider", "stt", "bitrix", "storage", "db"):
         obj = getattr(app.state, key, None)
         if obj:
             try:
@@ -362,6 +379,124 @@ async def _do_transfer(
                                 "Не удалось перевести на оператора. Попробуйте позже.")
 
 
+# ---------------------------------------------------------------------------
+# Voice message handling
+# ---------------------------------------------------------------------------
+
+
+async def _extract_voice_text(
+    params: Dict[str, Any],
+    message_id: str,
+    dialog_id: str,
+    bitrix: BitrixClient,
+    settings: Settings,
+) -> Optional[str]:
+    """Try to extract and transcribe a voice message from the event params.
+
+    Bitrix sends file attachments in ONIMBOTMESSAGEADD under the PARAMS
+    as ``FILES`` — a dict mapping file indices to file info dicts, each
+    containing ``type``, ``name``, ``link``, ``size``, etc.
+
+    If no voice file is found, returns None.
+    If transcription succeeds, returns the transcribed text.
+    If transcription fails, returns a fallback error string.
+    """
+    stt: Optional[SpeechToText] = getattr(app.state, "stt", None)
+    if not stt:
+        return None
+
+    # Bitrix sends FILES as a nested dict: FILES[0][name], FILES[0][link], etc.
+    files_raw = params.get("FILES")
+    if not files_raw or not isinstance(files_raw, dict):
+        return None
+
+    # Find first audio/voice file
+    voice_url: Optional[str] = None
+    voice_name: str = "voice.ogg"
+    voice_mime: str = ""
+
+    # files_raw can be {"0": {"name": ..., "link": ..., "type": ...}, "1": {...}}
+    file_entries = files_raw.values() if isinstance(files_raw, dict) else []
+    for f in file_entries:
+        if not isinstance(f, dict):
+            continue
+        fname = str(f.get("name", "") or "")
+        ftype = str(f.get("type", "") or "")
+        flink = str(f.get("link", "") or "")
+
+        log.info("voice_file_candidate", extra={
+            "dialog_id": dialog_id,
+            "message_id": message_id,
+            "filename": fname,
+            "mime_type": ftype,
+            "link": flink[:100] if flink else "",
+        })
+
+        if is_voice_file(mime_type=ftype, filename=fname):
+            voice_url = flink
+            voice_name = fname or "voice.ogg"
+            voice_mime = ftype
+            break
+
+    if not voice_url:
+        return None
+
+    log.info("voice_message_detected", extra={
+        "dialog_id": dialog_id,
+        "message_id": message_id,
+        "filename": voice_name,
+        "mime_type": voice_mime,
+        "url": voice_url[:100],
+    })
+
+    # Download the audio file
+    try:
+        audio_bytes = await bitrix.download_file(voice_url)
+    except (BitrixError, Exception) as e:
+        log.warning("voice_download_failed", extra={
+            "dialog_id": dialog_id,
+            "error": str(e),
+            "url": voice_url[:100],
+        })
+        return None
+
+    if not audio_bytes:
+        log.warning("voice_download_empty", extra={"dialog_id": dialog_id})
+        return None
+
+    log.info("voice_downloaded", extra={
+        "dialog_id": dialog_id,
+        "size_bytes": len(audio_bytes),
+        "filename": voice_name,
+    })
+
+    # Transcribe via Whisper
+    try:
+        transcript = await stt.transcribe(
+            audio_bytes,
+            filename=voice_name,
+            language=settings.stt_language,
+        )
+    except SpeechToTextError as e:
+        log.warning("voice_transcription_failed", extra={
+            "dialog_id": dialog_id,
+            "error": str(e),
+        })
+        return "[voice_error]"
+
+    if not transcript or not transcript.strip():
+        log.info("voice_transcription_empty", extra={"dialog_id": dialog_id})
+        return "[voice_empty]"
+
+    log.info("voice_transcribed", extra={
+        "dialog_id": dialog_id,
+        "text_length": len(transcript),
+        "text_preview": transcript[:100],
+    })
+
+    return transcript.strip()
+
+
 @app.post("/b24/imbot/events")
 async def b24_imbot_events(
     request: Request,
@@ -406,6 +541,7 @@ async def b24_imbot_events(
 
         dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
         message = params.get("MESSAGE") if isinstance(params, dict) else None
+        message_id = str(params.get("MESSAGE_ID", "") or "") if isinstance(params, dict) else ""
         chat_id = params.get("TO_CHAT_ID") if isinstance(params, dict) else None
         # ONIMBOTJOINCHAT sends CHAT_ID at top-level PARAMS
         if not chat_id:
@@ -443,6 +579,54 @@ async def b24_imbot_events(
             message = ""
 
         text = message.strip()
+
+        # --- Voice message handling ---
+        # If the message has file attachments, check for voice/audio files
+        # and transcribe them.  The transcription replaces or supplements
+        # the text body (which is usually empty for voice messages).
+        voice_transcript: Optional[str] = None
+        if isinstance(params, dict):
+            voice_transcript = await _extract_voice_text(
+                params, message_id, dialog_id, bitrix, settings,
+            )
+
+        if voice_transcript == "[voice_error]":
+            # Transcription failed — notify user
+            await _send_bot_message(
+                bitrix, settings, dialog_id,
+                "Не удалось распознать голосовое сообщение. "
+                "Пожалуйста, напишите текстом или попробуйте записать ещё раз 🎤",
+            )
+            return {"ok": "true"}
+
+        if voice_transcript == "[voice_empty]":
+            await _send_bot_message(
+                bitrix, settings, dialog_id,
+                "Голосовое сообщение не содержит распознаваемой речи. "
+                "Попробуйте ещё раз или напишите текстом 🎤",
+            )
+            return {"ok": "true"}
+
+        if voice_transcript:
+            # Use the transcription as the message text.
+            # If there was also text in the message, combine them.
+            if text:
+                text = f"{text}\n\n(голосовое сообщение: {voice_transcript})"
+            else:
+                text = voice_transcript
+
+            log.info("voice_used_as_text", extra={
+                "dialog_id": dialog_id,
+                "text_length": len(text),
+            })
+
+            # Send the recognised text back to the user so they see what
+            # the bot "heard" (makes the conversation transparent).
+            await _send_bot_message(
+                bitrix, settings, dialog_id,
+                f"🎤 Распознано: {voice_transcript}",
+            )
+
         if not text:
             log.info("imbot_event_ignored", extra={"reason": "empty_message"})
             return {"ok": "true"}
