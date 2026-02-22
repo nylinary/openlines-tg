@@ -35,6 +35,25 @@ class Settings(BaseSettings):
     def b24_imbot_event_handler(self) -> str:
         return f"https://{self.public_domain}/b24/imbot/events"
 
+    # LLM (OpenAI-compatible API)
+    llm_temperature: float = Field(default=0.3, alias="LLM_TEMPERATURE")
+    llm_max_tokens: int = Field(default=2000, alias="LLM_MAX_TOKENS")
+
+    # OpenAI (or any OpenAI-compatible API — Azure, local proxy, etc.)
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
+    openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")  # custom endpoint (optional)
+
+    # Scraper schedule (seconds)
+    scraper_full_interval_s: int = Field(default=86400, alias="SCRAPER_FULL_INTERVAL_S")  # daily
+    scraper_price_interval_s: int = Field(default=3600, alias="SCRAPER_PRICE_INTERVAL_S")  # hourly
+
+    # PostgreSQL
+    database_url: str = Field(
+        default="postgresql://myryba:myryba@postgres:5432/myryba",
+        alias="DATABASE_URL",
+    )
+
     # Redis
     redis_url: str = Field(default="redis://redis:6379/0", alias="REDIS_URL")
 

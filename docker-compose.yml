@@ -1,6 +1,22 @@
 version: "3.9"
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: myryba
+      POSTGRES_PASSWORD: myryba
+      POSTGRES_DB: myryba
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myryba"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     ports:
@@ -9,6 +25,7 @@ services:
   app:
     build: .
     environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://myryba:myryba@postgres:5432/myryba}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - B24_DOMAIN=${B24_DOMAIN}
       - B24_CLIENT_ID=${B24_CLIENT_ID}
@@ -19,9 +36,23 @@ services:
       - B24_IMBOT_CODE=${B24_IMBOT_CODE}
       - B24_IMBOT_NAME=${B24_IMBOT_NAME}
       - B24_IMBOT_CLIENT_ID=${B24_IMBOT_CLIENT_ID}
+      - B24_WEBHOOK_URL=${B24_WEBHOOK_URL}
       - HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S:-10}
       - HTTP_RETRIES=${HTTP_RETRIES:-3}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.3}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-2000}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - SCRAPER_FULL_INTERVAL_S=${SCRAPER_FULL_INTERVAL_S:-86400}
+      - SCRAPER_PRICE_INTERVAL_S=${SCRAPER_PRICE_INTERVAL_S:-3600}
     ports:
       - "8000:8000"
     depends_on:
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  pg-data:

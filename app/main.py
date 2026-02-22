@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
+from .ai_chat import AIChatHandler
 from .bitrix import BitrixClient, BitrixOAuthError
 from .config import Settings, get_settings
+from .database import Database
+from .llm import LLMError, create_llm_provider
 from .logging import setup_logging
+from .scraper import ProductCatalog
 from .storage import Storage
 
 log = logging.getLogger("app")
 
-app = FastAPI(title="b24-imbot-proxy", version="0.2.0")
+app = FastAPI(title="b24-imbot-proxy", version="0.3.0")
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +32,18 @@ async def _startup() -> None:
     setup_logging()
 
     app.state.settings = settings
-    app.state.storage = Storage(settings.redis_url)
+
+    # --- PostgreSQL ---
+    app.state.db = Database(settings.database_url)
+    try:
+        await app.state.db.connect()
+        log.info("postgres_connected")
+    except Exception as e:
+        log.error("postgres_connect_failed", extra={"error": str(e)})
+        app.state.db = None
+
+    # --- Redis + Storage (with optional PG write-through) ---
+    app.state.storage = Storage(settings.redis_url, db=app.state.db)
 
     app.state.bitrix = BitrixClient(
         domain=settings.b24_domain,
@@ -39,6 +55,33 @@ async def _startup() -> None:
         retries=settings.http_retries,
     )
 
+    # --- Product catalog ---
+    app.state.catalog = ProductCatalog(db=app.state.db)
+    await app.state.catalog.load_from_db()
+
+    # --- LLM provider (optional — gracefully degrade if not configured) ---
+    app.state.llm_provider = None  # Optional[LLMProvider]
+    app.state.ai_chat = None  # Optional[AIChatHandler]
+
+    try:
+        llm = create_llm_provider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            base_url=settings.openai_base_url,
+            temperature=settings.llm_temperature,
+            max_tokens=settings.llm_max_tokens,
+            timeout_s=settings.http_timeout_s,
+        )
+        app.state.llm_provider = llm
+        app.state.ai_chat = AIChatHandler(
+            llm=llm,
+            catalog=app.state.catalog,
+            storage=app.state.storage,
+        )
+        log.info("llm_provider_enabled", extra={"provider": llm.provider_name})
+    except (ValueError, LLMError) as e:
+        log.warning("llm_provider_disabled", extra={"error": str(e), "hint": "check OPENAI_API_KEY and credentials"})
+
     # Verify OAuth token is available (non-fatal)
     try:
         await app.state.bitrix.ensure_token()
@@ -46,25 +89,92 @@ async def _startup() -> None:
     except BitrixOAuthError:
         log.warning("bitrix_oauth_not_installed", extra={"hint": "open /b24/install to authorize app"})
 
+    # --- Background scraper task ---
+    app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
+
     log.info(
         "startup_complete",
         extra={
             "imbot_id": settings.b24_imbot_id,
             "imbot_code": settings.b24_imbot_code,
             "event_handler": settings.b24_imbot_event_handler,
+            "ai_enabled": app.state.ai_chat is not None,
+            "catalog_products": len(app.state.catalog.products),
         },
     )
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    for key in ("bitrix", "storage"):
+    # Cancel background scraper
+    task = getattr(app.state, "scraper_task", None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    for key in ("llm_provider", "bitrix", "storage", "db"):
         obj = getattr(app.state, key, None)
         if obj:
             try:
                 await obj.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Background scraper loop
+# ---------------------------------------------------------------------------
+
+
+async def _scraper_loop(settings: Settings, catalog: ProductCatalog) -> None:
+    """Background task: full scrape daily, price/quantity refresh hourly."""
+    import time as _time
+
+    # Initial scrape if catalog is empty or stale
+    await asyncio.sleep(5)  # let the app finish starting up
+    try:
+        if not catalog.products:
+            log.info("scraper_initial_full_scrape")
+            await catalog.full_scrape()
+            # Invalidate AI prompt cache after scrape
+            ai_chat = getattr(app.state, "ai_chat", None)
+            if ai_chat:
+                ai_chat.invalidate_system_prompt_cache()
+    except Exception as e:
+        log.error("scraper_initial_error", extra={"error": str(e)})
+
+    while True:
+        try:
+            now = _time.time()
+
+            # Full scrape if overdue
+            if now - catalog.last_full_scrape >= settings.scraper_full_interval_s:
+                log.info("scraper_full_scrape_start")
+                await catalog.full_scrape()
+                ai_chat = getattr(app.state, "ai_chat", None)
+                if ai_chat:
+                    ai_chat.invalidate_system_prompt_cache()
+                log.info("scraper_full_scrape_done", extra={"products": len(catalog.products)})
+
+            # Price refresh if overdue (and not just did a full scrape)
+            elif now - catalog.last_price_refresh >= settings.scraper_price_interval_s:
+                log.info("scraper_price_refresh_start")
+                await catalog.refresh_prices()
+                ai_chat = getattr(app.state, "ai_chat", None)
+                if ai_chat:
+                    ai_chat.invalidate_system_prompt_cache()
+                log.info("scraper_price_refresh_done", extra={"products": len(catalog.products)})
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("scraper_loop_error", extra={"error": str(e)})
+
+        # Sleep for a short interval, then re-check
+        await asyncio.sleep(60)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +192,14 @@ def storage_dep() -> Storage:
 
 def bitrix_dep() -> BitrixClient:
     return app.state.bitrix
+
+
+def ai_chat_dep() -> Optional[AIChatHandler]:
+    return getattr(app.state, "ai_chat", None)
+
+
+def catalog_dep() -> ProductCatalog:
+    return app.state.catalog
 
 
 # ---------------------------------------------------------------------------
@@ -200,13 +318,15 @@ async def b24_imbot_events(
     request: Request,
     settings: Settings = Depends(settings_dep),
     bitrix: BitrixClient = Depends(bitrix_dep),
+    ai_chat: Optional[AIChatHandler] = Depends(ai_chat_dep),
 ) -> Dict[str, str]:
     """Receive events from Bitrix for the UI-registered bot.
 
     Bitrix sends bot events as **form-encoded** POST
     (``application/x-www-form-urlencoded``), not JSON.
 
-    Echoes incoming message text back via ``imbot.message.add``.
+    Routes messages through the AI chat handler (if configured)
+    or falls back to echo mode.
     """
     try:
         content_type = request.headers.get("content-type", "")
@@ -256,18 +376,76 @@ async def b24_imbot_events(
             log.info("imbot_event_ignored", extra={"reason": "empty_message"})
             return {"ok": "true"}
 
-        # --- keyword: "оператор" → transfer to a live operator ---
-        if text.lower() in ("оператор", "operator"):
-            await _transfer_to_operator(bitrix, settings, dialog_id, chat_id)
-            return {"ok": "true"}
+        # --- AI-powered response (or echo fallback) ---
+        if ai_chat is not None:
+            reply_text, transfer = await ai_chat.handle_message(dialog_id, text)
 
-        # --- default: echo reply ---
-        await _send_bot_message(bitrix, settings, dialog_id, f"echo: {text}")
+            if transfer:
+                # AI detected operator request — transfer
+                await _transfer_to_operator(bitrix, settings, dialog_id, chat_id)
+            else:
+                await _send_bot_message(bitrix, settings, dialog_id, reply_text)
+        else:
+            # No AI configured — fall back to keyword check + echo
+            if text.lower() in ("оператор", "operator"):
+                await _transfer_to_operator(bitrix, settings, dialog_id, chat_id)
+            else:
+                await _send_bot_message(bitrix, settings, dialog_id, f"echo: {text}")
 
     except Exception as e:
         log.exception("imbot_event_handler_error", extra={"error": str(e)})
 
     return {"ok": "true"}
+
+
+# ---------------------------------------------------------------------------
+# Catalog / scraper management endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/catalog/stats")
+async def catalog_stats(
+    catalog: ProductCatalog = Depends(catalog_dep),
+) -> Dict[str, Any]:
+    """Return current catalog statistics."""
+    import time as _time
+
+    by_cat: Dict[str, int] = {}
+    for p in catalog.products:
+        cat = p.get("category", "unknown")
+        by_cat[cat] = by_cat.get(cat, 0) + 1
+
+    return {
+        "total_products": len(catalog.products),
+        "by_category": by_cat,
+        "last_full_scrape": catalog.last_full_scrape,
+        "last_full_scrape_ago_s": round(_time.time() - catalog.last_full_scrape) if catalog.last_full_scrape else None,
+        "last_price_refresh": catalog.last_price_refresh,
+        "last_price_refresh_ago_s": round(_time.time() - catalog.last_price_refresh) if catalog.last_price_refresh else None,
+    }
+
+
+@app.post("/catalog/scrape")
+async def catalog_scrape(
+    catalog: ProductCatalog = Depends(catalog_dep),
+) -> Dict[str, Any]:
+    """Trigger a full product scrape (manual)."""
+    count = await catalog.full_scrape()
+    ai_chat = getattr(app.state, "ai_chat", None)
+    if ai_chat:
+        ai_chat.invalidate_system_prompt_cache()
+    return {"ok": "true", "products_scraped": count}
+
+
+@app.get("/catalog/search")
+async def catalog_search(
+    q: str = Query(default=""),
+    limit: int = Query(default=10, ge=1, le=50),
+    catalog: ProductCatalog = Depends(catalog_dep),
+) -> Dict[str, Any]:
+    """Search the product catalog."""
+    results = catalog.search(q, limit=limit)
+    return {"query": q, "count": len(results), "products": results}
 
 
 # ---------------------------------------------------------------------------
