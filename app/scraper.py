@@ -571,11 +571,11 @@ class ProductCatalog:
 
     def format_product_short(self, p: Dict[str, Any]) -> str:
         """Format a product for chat display (short)."""
-        parts = [f"**{p.get('title', 'Без названия')}**"]
+        parts = [p.get("title", "Без названия")]
         if p.get("price"):
             price_str = f"{p['price']} ₽"
             if p.get("priceold"):
-                price_str = f"~~{p['priceold']}~~ {p['price']} ₽"
+                price_str = f"{p['priceold']} → {p['price']} ₽"
             parts.append(price_str)
         if p.get("portion"):
             parts.append(str(p["portion"]))
