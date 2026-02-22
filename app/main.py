@@ -390,6 +390,8 @@ async def _extract_voice_text(
     dialog_id: str,
     bitrix: BitrixClient,
     settings: Settings,
+    *,
+    event_auth: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Try to extract and transcribe a voice message from the event params.
 
@@ -461,13 +463,40 @@ async def _extract_voice_text(
     })
 
     # Download the audio file.
-    # Strategy 1: direct URL download (urlDownload from the event payload).
-    # Strategy 2: REST API disk.file.get → DOWNLOAD_URL (fallback if URL
-    #             returns HTML or fails, which happens when Bitrix requires
-    #             a different auth mechanism for disk files).
+    # Strategy 1: use the event auth token to call disk.file.get on the
+    #             event's domain.  This is the most reliable approach
+    #             because the event token has the correct user context.
+    # Strategy 2: direct URL download (urlDownload from the event payload).
+    # Strategy 3: REST API disk.file.get via webhook (fallback).
     audio_bytes: Optional[bytes] = None
 
-    if voice_url:
+    # Strategy 1: event auth token → disk.file.get
+    if not audio_bytes and voice_file_id and event_auth:
+        event_token = str(event_auth.get("access_token", "") or "")
+        event_domain = str(event_auth.get("domain", "") or "")
+        if event_token and event_domain:
+            try:
+                audio_bytes = await bitrix.download_file_by_event_token(
+                    voice_file_id,
+                    access_token=event_token,
+                    domain=event_domain,
+                )
+                log.info("voice_download_event_token_ok", extra={
+                    "dialog_id": dialog_id,
+                    "file_id": voice_file_id,
+                    "domain": event_domain,
+                    "size_bytes": len(audio_bytes) if audio_bytes else 0,
+                })
+            except (BitrixError, Exception) as e:
+                log.warning("voice_download_event_token_failed", extra={
+                    "dialog_id": dialog_id,
+                    "file_id": voice_file_id,
+                    "domain": event_domain,
+                    "error": str(e),
+                })
+
+    # Strategy 2: direct URL download
+    if not audio_bytes and voice_url:
         try:
             audio_bytes = await bitrix.download_file(voice_url)
         except (BitrixError, Exception) as e:
@@ -477,7 +506,7 @@ async def _extract_voice_text(
                 "url": voice_url[:100],
             })
 
-    # Fallback: download via REST API by file ID
+    # Strategy 3: download via REST API by file ID (webhook)
     if not audio_bytes and voice_file_id:
         try:
             audio_bytes = await bitrix.download_file_by_id(
@@ -595,7 +624,14 @@ async def b24_imbot_events(
                 "dialog_id": dialog_id,
                 "chat_id": chat_id,
                 "msg_text": message,
+                "auth_domain": (auth.get("domain") if isinstance(auth, dict) else None),
+                "auth_member_id": (auth.get("member_id") if isinstance(auth, dict) else None),
                 "auth_application_token": (auth.get("application_token") if isinstance(auth, dict) else None),
+                "auth_access_token_preview": (
+                    auth["access_token"][:8] + "..."
+                    if isinstance(auth, dict) and auth.get("access_token")
+                    else None
+                ),
             },
         )
 
@@ -627,6 +663,7 @@ async def b24_imbot_events(
         if isinstance(params, dict):
             voice_transcript = await _extract_voice_text(
                 params, message_id, dialog_id, bitrix, settings,
+                event_auth=auth if isinstance(auth, dict) else None,
             )
 
         if voice_transcript == "[voice_error]":

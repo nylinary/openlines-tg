@@ -172,6 +172,79 @@ class BitrixClient:
         except Exception as e:
             raise BitrixError(f"disk.file.get download failed for {file_id}: {e}") from e
 
+    async def download_file_by_event_token(
+        self,
+        file_id: str,
+        *,
+        access_token: str,
+        domain: str,
+    ) -> bytes:
+        """Download a Bitrix disk file using an access token from an event.
+
+        Bitrix event payloads include an ``auth`` block with a fresh
+        access token scoped to the app.  This method uses that token
+        to call ``disk.file.get`` on the event's domain, then downloads
+        the file via the returned ``DOWNLOAD_URL``.
+
+        This is the most reliable way to download IM chat file attachments
+        because:
+        - The AJAX ``urlDownload`` requires browser session cookies.
+        - The webhook may not have ``disk`` scope or file-level access.
+        - The event token is scoped to the app that received the event
+          and runs in the user context that has access to the chat file.
+        """
+        domain = domain.strip().replace("https://", "").replace("http://", "").rstrip("/")
+        url = f"https://{domain}/rest/disk.file.get.json?auth={access_token}"
+
+        try:
+            log.info("bitrix_event_token_disk_file_get", extra={
+                "file_id": file_id,
+                "domain": domain,
+            })
+
+            r = await self._client.post(url, data={"id": file_id})
+            payload = r.json() if r.text else {}
+
+            if isinstance(payload, dict) and payload.get("error"):
+                raise BitrixError(
+                    f"disk.file.get via event token: "
+                    f"{payload.get('error')}: {payload.get('error_description', '')}"
+                )
+
+            result = payload.get("result", {})
+            if not isinstance(result, dict):
+                raise BitrixError(f"disk.file.get via event token: unexpected result: {payload}")
+
+            download_url = str(result.get("DOWNLOAD_URL", "") or "")
+            if not download_url:
+                raise BitrixError(
+                    f"disk.file.get via event token: no DOWNLOAD_URL for file {file_id}"
+                )
+
+            log.info("bitrix_event_token_file_ok", extra={
+                "file_id": file_id,
+                "name": result.get("NAME", ""),
+                "size": result.get("SIZE", ""),
+                "download_url": _redact_bitrix_url(download_url)[:120],
+            })
+
+            # Download the actual file content from DOWNLOAD_URL
+            r2 = await self._client.get(download_url, follow_redirects=True)
+            r2.raise_for_status()
+
+            content_type = r2.headers.get("content-type", "")
+            if "text/html" in content_type:
+                raise BitrixError(
+                    f"DOWNLOAD_URL returned HTML (content-type: {content_type})"
+                )
+
+            return r2.content
+
+        except BitrixError:
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as e:
+            raise BitrixError(f"Event token file download failed for {file_id}: {e}") from e
+
     # --- OAuth ---
 
     def auth_url(self, *, state: str) -> str:
