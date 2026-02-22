@@ -66,26 +66,89 @@ class BitrixClient:
 
         Bitrix file URLs may require auth.  If the URL is on the same
         domain, an access token query param is appended automatically.
+
+        Bitrix disk download URLs may contain ``humanRE=1`` which causes
+        the server to return an HTML wrapper page instead of raw bytes.
+        We detect this and raise an error.
         """
         try:
+            download_url = url
+
             # If it's a Bitrix domain URL, ensure auth token is present
-            if self.domain in url and "auth=" not in url:
+            if self.domain in download_url and "auth=" not in download_url:
                 try:
                     token = await self.ensure_token()
-                    separator = "&" if "?" in url else "?"
-                    url = f"{url}{separator}auth={token}"
+                    separator = "&" if "?" in download_url else "?"
+                    download_url = f"{download_url}{separator}auth={token}"
                 except Exception:
                     pass  # try without auth
 
-            r = await self._client.get(url, follow_redirects=True)
+            r = await self._client.get(download_url, follow_redirects=True)
             r.raise_for_status()
+
+            content_type = r.headers.get("content-type", "")
+            content_length = len(r.content)
+
+            log.info("bitrix_file_downloaded", extra={
+                "url": _redact_bitrix_url(download_url)[:120],
+                "status": r.status_code,
+                "content_type": content_type,
+                "content_length": content_length,
+            })
+
+            # Bitrix may return an HTML page instead of the file
+            # (e.g. login page, error page, humanRE wrapper)
+            if "text/html" in content_type:
+                log.warning("bitrix_file_download_html", extra={
+                    "url": _redact_bitrix_url(download_url)[:120],
+                    "content_length": content_length,
+                    "body_preview": r.text[:300] if r.text else "",
+                })
+                raise BitrixError(
+                    f"Bitrix returned HTML instead of file (content-type: {content_type})"
+                )
+
             return r.content
+        except BitrixError:
+            raise
         except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as e:
             log.error("bitrix_file_download_error", extra={
-                "url": _redact_bitrix_url(url),
+                "url": _redact_bitrix_url(url)[:120],
                 "error": str(e),
             })
             raise BitrixError(f"File download failed: {e}") from e
+
+    async def download_file_by_id(self, file_id: str) -> bytes:
+        """Download a Bitrix disk file by its ID using the REST API.
+
+        Uses ``disk.file.get`` to retrieve file metadata including a
+        direct download URL, then downloads the actual content.
+        This is more reliable than using ``urlDownload`` from chat
+        file attachments, which may return HTML wrapper pages.
+        """
+        try:
+            # Get file info with direct download link
+            resp = await self.call("disk.file.get", {"id": file_id})
+            result = resp.get("result", {})
+            if not isinstance(result, dict):
+                raise BitrixError(f"disk.file.get returned unexpected result: {resp}")
+
+            download_url = str(result.get("DOWNLOAD_URL", "") or "")
+            if not download_url:
+                raise BitrixError(f"disk.file.get returned no DOWNLOAD_URL for file {file_id}")
+
+            log.info("bitrix_disk_file_get_ok", extra={
+                "file_id": file_id,
+                "name": result.get("NAME", ""),
+                "size": result.get("SIZE", ""),
+                "download_url": _redact_bitrix_url(download_url)[:120],
+            })
+
+            return await self.download_file(download_url)
+        except BitrixError:
+            raise
+        except Exception as e:
+            raise BitrixError(f"disk.file.get download failed for {file_id}: {e}") from e
 
     # --- OAuth ---
 

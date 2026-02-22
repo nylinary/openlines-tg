@@ -413,6 +413,7 @@ async def _extract_voice_text(
 
     # Find first audio/voice file
     voice_url: Optional[str] = None
+    voice_file_id: Optional[str] = None
     voice_name: str = "voice.ogg"
     voice_mime: str = ""
 
@@ -423,6 +424,7 @@ async def _extract_voice_text(
             continue
         fname = str(f.get("name", "") or "")
         ftype = str(f.get("type", "") or "")
+        fid = str(f.get("id", "") or "")
         # Bitrix uses urlDownload / urlShow, not "link"
         flink = str(f.get("urlDownload", "") or f.get("urlShow", "") or f.get("link", "") or "")
         # Bitrix includes viewerAttrs.viewerType == "audio" for voice/audio
@@ -433,6 +435,7 @@ async def _extract_voice_text(
             "dialog_id": dialog_id,
             "message_id": message_id,
             "file_name": fname,
+            "file_id": fid,
             "mime_type": ftype,
             "viewer_type": viewer_type,
             "link": flink[:100] if flink else "",
@@ -440,34 +443,61 @@ async def _extract_voice_text(
 
         if is_voice_file(mime_type=ftype, filename=fname, viewer_type=viewer_type):
             voice_url = flink
+            voice_file_id = fid
             voice_name = fname or "voice.ogg"
             voice_mime = ftype
             break
 
-    if not voice_url:
+    if not voice_url and not voice_file_id:
         return None
 
     log.info("voice_message_detected", extra={
         "dialog_id": dialog_id,
         "message_id": message_id,
         "file_name": voice_name,
+        "file_id": voice_file_id or "",
         "mime_type": voice_mime,
-        "url": voice_url[:100],
+        "url": voice_url[:100] if voice_url else "",
     })
 
-    # Download the audio file
-    try:
-        audio_bytes = await bitrix.download_file(voice_url)
-    except (BitrixError, Exception) as e:
-        log.warning("voice_download_failed", extra={
-            "dialog_id": dialog_id,
-            "error": str(e),
-            "url": voice_url[:100],
-        })
-        return None
+    # Download the audio file.
+    # Strategy 1: direct URL download (urlDownload from the event payload).
+    # Strategy 2: REST API disk.file.get → DOWNLOAD_URL (fallback if URL
+    #             returns HTML or fails, which happens when Bitrix requires
+    #             a different auth mechanism for disk files).
+    audio_bytes: Optional[bytes] = None
+
+    if voice_url:
+        try:
+            audio_bytes = await bitrix.download_file(voice_url)
+        except (BitrixError, Exception) as e:
+            log.warning("voice_download_url_failed", extra={
+                "dialog_id": dialog_id,
+                "error": str(e),
+                "url": voice_url[:100],
+            })
+
+    # Fallback: download via REST API by file ID
+    if not audio_bytes and voice_file_id:
+        try:
+            audio_bytes = await bitrix.download_file_by_id(voice_file_id)
+            log.info("voice_download_by_id_ok", extra={
+                "dialog_id": dialog_id,
+                "file_id": voice_file_id,
+                "size_bytes": len(audio_bytes) if audio_bytes else 0,
+            })
+        except (BitrixError, Exception) as e:
+            log.warning("voice_download_by_id_failed", extra={
+                "dialog_id": dialog_id,
+                "file_id": voice_file_id,
+                "error": str(e),
+            })
 
     if not audio_bytes:
-        log.warning("voice_download_empty", extra={"dialog_id": dialog_id})
+        log.warning("voice_download_all_failed", extra={
+            "dialog_id": dialog_id,
+            "file_id": voice_file_id or "",
+        })
         return None
 
     log.info("voice_downloaded", extra={
