@@ -186,62 +186,83 @@ async def _scraper_loop(settings: Settings, catalog: ProductCatalog) -> None:
 
 
 async def _session_watchdog(settings: Settings) -> None:
-    """Background safety-net: periodically check for orphaned OL sessions.
+    """Background safety-net: monitor sessions and detect operator closures.
 
-    Polls ``imopenlines.session.list`` for sessions that are closed/waiting
-    but not assigned to our bot.  If found, logs a warning.
+    Two strategies combined:
 
-    In practice this should never fire if the Bitrix Open Line is configured
-    correctly ("assign chatbot on repeat message"), because Bitrix itself
-    re-assigns the bot when the client writes again.  This watchdog exists
-    purely as a diagnostic/monitoring tool.
+    **Strategy A — Redis-based** (fast, event-driven):
+    Scans sessions marked as ``transferred`` in Redis.  When a transferred
+    session has been idle for >2 minutes (operator likely closed it), marks
+    it as ``closed``.  The next ``ONIMBOTJOINCHAT`` event will clear history.
 
-    Interval: every 5 minutes.
+    **Strategy B — Bitrix API polling** (slower, catches edge cases):
+    Calls ``imopenlines.session.list`` to find sessions that Bitrix considers
+    closed but where our bot is not assigned.  Logs them for diagnostics.
+
+    Interval: every 2 minutes.
     """
     await asyncio.sleep(30)  # let startup finish
 
     while True:
         try:
+            storage: Storage = app.state.storage
             bitrix: BitrixClient = app.state.bitrix
             bot_id = settings.b24_imbot_id
 
-            # Try listing recent OL sessions
-            resp = await _call_b24(bitrix, settings, "imopenlines.session.list", {
-                "LIMIT": 20,
-            })
-            sessions = resp.get("result", [])
-            if not isinstance(sessions, list):
-                sessions = []
+            # --- Strategy A: check transferred sessions in Redis ---
+            import time as _t
+            now = _t.time()
+            tracked = await storage.get_all_tracked_sessions()
+            for chat_id, info in tracked.items():
+                state = info.get("state", "")
+                ts = float(info.get("ts", "0") or "0")
 
-            for s in sessions:
-                if not isinstance(s, dict):
-                    continue
-                status = s.get("STATUS")
-                operator_id = s.get("OPERATOR_ID")
-                chat_id = s.get("CHAT_ID")
-                session_id = s.get("ID")
+                # Session was transferred to operator >2 min ago and not yet
+                # marked closed → operator may have closed it without us
+                # getting an ONIMBOTDELETE event.
+                if state == "transferred" and ts > 0 and (now - ts) > 120:
+                    await storage.mark_session_closed(chat_id)
+                    log.info("watchdog_transferred_to_closed", extra={
+                        "chat_id": chat_id,
+                        "age_s": round(now - ts),
+                    })
 
-                # Session is closed/finished and not assigned to our bot
-                if status in ("closed", "finish", "0") and operator_id != str(bot_id):
-                    log.info(
-                        "watchdog_orphaned_session",
-                        extra={
+            # --- Strategy B: poll Bitrix imopenlines.session.list ---
+            try:
+                resp = await _call_b24(bitrix, settings, "imopenlines.session.list", {
+                    "LIMIT": 20,
+                })
+                sessions = resp.get("result", [])
+                if not isinstance(sessions, list):
+                    sessions = []
+
+                for s in sessions:
+                    if not isinstance(s, dict):
+                        continue
+                    status = str(s.get("STATUS", ""))
+                    operator_id = str(s.get("OPERATOR_ID", ""))
+                    s_chat_id = str(s.get("CHAT_ID", ""))
+                    session_id = str(s.get("ID", ""))
+
+                    # Closed session not assigned to our bot — log for diagnostics
+                    if status in ("closed", "finish", "0") and operator_id != str(bot_id):
+                        log.info("watchdog_orphaned_session", extra={
                             "session_id": session_id,
-                            "chat_id": chat_id,
+                            "chat_id": s_chat_id,
                             "status": status,
                             "operator_id": operator_id,
                             "bot_id": bot_id,
-                        },
-                    )
+                        })
+            except Exception as e:
+                # imopenlines.session.list may not be available on all plans
+                log.debug("watchdog_api_error", extra={"error": str(e)})
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Don't crash the watchdog — imopenlines.session.list may not
-            # be available on all Bitrix plans or with all scopes.
-            log.debug("watchdog_error", extra={"error": str(e)})
+            log.warning("watchdog_loop_error", extra={"error": str(e)})
 
-        await asyncio.sleep(300)  # every 5 min
+        await asyncio.sleep(120)  # every 2 min
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +543,12 @@ async def _handle_bot_join(
     prev_state: Optional[str] = None
     if chat_id:
         prev_state = await storage.get_session_state(chat_id)
-        await storage.mark_session_active(chat_id)
+        await storage.set_session_info(
+            chat_id,
+            state="bot_active",
+            dialog_id=dialog_id or "",
+            line_id=str(settings.b24_openline_id) if settings.b24_openline_id else "",
+        )
 
     # If the previous state was "transferred" or "closed", this is a
     # returning session after operator close → clear old AI history.
@@ -561,6 +587,188 @@ async def _handle_bot_delete(
         cur = await storage.get_session_state(chat_id)
         if cur != "transferred":
             await storage.mark_session_closed(chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Open Line event webhook (via event.bind subscription)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/b24/ol/events")
+async def b24_ol_events(
+    request: Request,
+    settings: Settings = Depends(settings_dep),
+    bitrix: BitrixClient = Depends(bitrix_dep),
+    storage: Storage = Depends(storage_dep),
+) -> Dict[str, str]:
+    """Receive Open Line events subscribed via ``event.bind``.
+
+    Listens for:
+    * **ONOPENLINEMESSAGEDELETE** — fires when a session is closed/deleted.
+    * **ONIMCOMMANDADD** etc.   — any other subscribed events.
+
+    These events are separate from the bot handler events
+    (ONIMBOTMESSAGEADD, ONIMBOTJOINCHAT, ONIMBOTDELETE) which come
+    through ``/b24/imbot/events``.
+    """
+    try:
+        content_type = request.headers.get("content-type", "")
+
+        if "json" in content_type:
+            payload: Dict[str, Any] = await request.json()
+        else:
+            raw_form = await request.form()
+            payload = _parse_nested_form(dict(raw_form))
+
+        event = str(payload.get("event", "")).upper()
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+
+        log.info("ol_event_received", extra={
+            "event": event,
+            "data_keys": list(data.keys()) if data else [],
+            "payload": payload,
+        })
+
+        # --- ONOPENLINEMESSAGEDELETE: session/message deleted (session close) ---
+        if event == "ONOPENLINEMESSAGEDELETE":
+            chat_id = str(data.get("CHAT_ID", "") or "")
+            session_id = str(data.get("SESSION_ID", "") or "")
+            operator_id = str(data.get("OPERATOR_ID", "") or "")
+
+            log.info("ol_session_closed_event", extra={
+                "chat_id": chat_id,
+                "session_id": session_id,
+                "operator_id": operator_id,
+            })
+
+            if chat_id:
+                # Mark session as closed so next ONIMBOTJOINCHAT clears history
+                await storage.mark_session_closed(chat_id)
+
+    except Exception:
+        log.exception("ol_event_handler_error")
+
+    return {"ok": "true"}
+
+
+# ---------------------------------------------------------------------------
+# Event subscription management
+# ---------------------------------------------------------------------------
+
+
+@app.post("/b24/setup/events")
+async def b24_setup_events(
+    settings: Settings = Depends(settings_dep),
+    bitrix: BitrixClient = Depends(bitrix_dep),
+) -> Dict[str, Any]:
+    """Subscribe to Bitrix24 events via ``event.bind``.
+
+    Call this once after installing the app to register webhook handlers
+    for Open Line events.  Idempotent — safe to call multiple times.
+
+    Subscribes to:
+    * ``ONOPENLINEMESSAGEDELETE`` — session closed / message deleted
+    * ``ONOPENLINEMESSAGEADD``    — new OL message (for monitoring)
+    """
+    handler_url = settings.b24_ol_event_handler
+    events_to_bind = [
+        "ONOPENLINEMESSAGEDELETE",
+        "ONOPENLINEMESSAGEADD",
+    ]
+
+    results: Dict[str, Any] = {}
+    for event_name in events_to_bind:
+        try:
+            resp = await _call_b24(bitrix, settings, "event.bind", {
+                "EVENT": event_name,
+                "HANDLER": handler_url,
+            })
+            results[event_name] = {"ok": True, "result": resp.get("result")}
+            log.info("event_bind_ok", extra={"event": event_name, "handler": handler_url})
+        except Exception as e:
+            results[event_name] = {"ok": False, "error": str(e)}
+            log.warning("event_bind_failed", extra={"event": event_name, "error": str(e)})
+
+    return {"handler_url": handler_url, "bindings": results}
+
+
+@app.get("/b24/setup/events")
+async def b24_list_events(
+    settings: Settings = Depends(settings_dep),
+    bitrix: BitrixClient = Depends(bitrix_dep),
+) -> Dict[str, Any]:
+    """List currently bound events via ``event.get``."""
+    try:
+        resp = await _call_b24(bitrix, settings, "event.get", {})
+        return {"ok": True, "events": resp.get("result", [])}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.delete("/b24/setup/events")
+async def b24_unbind_events(
+    settings: Settings = Depends(settings_dep),
+    bitrix: BitrixClient = Depends(bitrix_dep),
+) -> Dict[str, Any]:
+    """Unbind all event subscriptions for our handler URL."""
+    handler_url = settings.b24_ol_event_handler
+    events_to_unbind = [
+        "ONOPENLINEMESSAGEDELETE",
+        "ONOPENLINEMESSAGEADD",
+    ]
+
+    results: Dict[str, Any] = {}
+    for event_name in events_to_unbind:
+        try:
+            resp = await _call_b24(bitrix, settings, "event.unbind", {
+                "EVENT": event_name,
+                "HANDLER": handler_url,
+            })
+            results[event_name] = {"ok": True, "result": resp.get("result")}
+        except Exception as e:
+            results[event_name] = {"ok": False, "error": str(e)}
+
+    return {"handler_url": handler_url, "unbindings": results}
+
+
+# ---------------------------------------------------------------------------
+# Session debugging endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/b24/sessions")
+async def b24_sessions(
+    storage: Storage = Depends(storage_dep),
+    settings: Settings = Depends(settings_dep),
+) -> Dict[str, Any]:
+    """Debug endpoint: list all tracked bot sessions from Redis."""
+    import time as _t
+    tracked = await storage.get_all_tracked_sessions()
+    now = _t.time()
+
+    sessions = []
+    for chat_id, info in tracked.items():
+        ts = float(info.get("ts", "0") or "0")
+        sessions.append({
+            "chat_id": chat_id,
+            "state": info.get("state"),
+            "dialog_id": info.get("dialog_id", ""),
+            "user_id": info.get("user_id", ""),
+            "line_id": info.get("line_id", ""),
+            "age_s": round(now - ts) if ts else None,
+        })
+
+    # Sort by most recent first
+    sessions.sort(key=lambda s: s.get("age_s") or 999999)
+
+    return {
+        "bot_id": settings.b24_imbot_id,
+        "openline_id": settings.b24_openline_id,
+        "tracked_sessions": len(sessions),
+        "sessions": sessions,
+    }
 
 
 # ---------------------------------------------------------------------------

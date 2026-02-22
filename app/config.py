@@ -31,9 +31,19 @@ class Settings(BaseSettings):
     # Example: https://b24-xxx.bitrix24.ru/rest/1/abc123/
     b24_webhook_url: str = Field(default="", alias="B24_WEBHOOK_URL")
 
+    # Open Line ID — needed for session monitoring & auto-reassignment.
+    # Find via Bitrix admin: Contact Center → Open Lines → line settings URL
+    # contains the numeric ID, or call imopenlines.config.list.
+    b24_openline_id: int = Field(default=0, alias="B24_OPENLINE_ID")
+
     @property
     def b24_imbot_event_handler(self) -> str:
         return f"https://{self.public_domain}/b24/imbot/events"
+
+    @property
+    def b24_ol_event_handler(self) -> str:
+        """URL for Open Line event webhooks (event.bind)."""
+        return f"https://{self.public_domain}/b24/ol/events"
 
     # LLM (OpenAI-compatible API)
     llm_temperature: float = Field(default=0.3, alias="LLM_TEMPERATURE")
