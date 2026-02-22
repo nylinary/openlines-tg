@@ -125,6 +125,22 @@ class Storage:
     _SESSION_PREFIX = "bot:session:"
     _SESSION_TTL = 7 * 24 * 3600  # 7 days
 
+    async def _ensure_session_hash(self, key: str) -> None:
+        """If the key exists as a non-hash type (legacy string), delete it first.
+
+        Old code stored session state as a plain Redis string via
+        ``redis.set(key, "transferred")``.  The new code uses hashes.
+        Calling HSET/HGET on a string key raises WRONGTYPE, so we need
+        to detect and migrate by deleting the old key.
+        """
+        try:
+            key_type = await self._redis.type(key)
+        except Exception:
+            return
+        if key_type not in ("hash", "none"):
+            log.info("session_key_migrated", extra={"key": key, "old_type": key_type})
+            await self._redis.delete(key)
+
     async def set_session_info(
         self,
         chat_id: str,
@@ -136,6 +152,7 @@ class Storage:
     ) -> None:
         """Store full session info as a Redis hash."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._ensure_session_hash(key)
         mapping: Dict[str, str] = {"state": state, "ts": str(int(time.time()))}
         if dialog_id:
             mapping["dialog_id"] = dialog_id
@@ -149,32 +166,52 @@ class Storage:
     async def mark_session_transferred(self, chat_id: str) -> None:
         """Mark that the bot transferred this chat to an operator."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
-        await self._redis.hset(key, "state", "transferred")
+        await self._ensure_session_hash(key)
+        await self._redis.hset(key, mapping={"state": "transferred", "ts": str(int(time.time()))})
         await self._redis.expire(key, self._SESSION_TTL)
 
     async def mark_session_active(self, chat_id: str) -> None:
         """Mark that the bot is active in this chat."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._ensure_session_hash(key)
         await self._redis.hset(key, mapping={"state": "bot_active", "ts": str(int(time.time()))})
         await self._redis.expire(key, self._SESSION_TTL)
 
     async def mark_session_closed(self, chat_id: str) -> None:
         """Mark that the bot was removed from this chat (session closed or operator took over)."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._ensure_session_hash(key)
         await self._redis.hset(key, mapping={"state": "closed", "ts": str(int(time.time()))})
         await self._redis.expire(key, self._SESSION_TTL)
 
     async def get_session_state(self, chat_id: str) -> Optional[str]:
         """Get the current session state: 'bot_active', 'transferred', 'closed', or None."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
-        val = await self._redis.hget(key, "state")
-        return val or None
+        try:
+            val = await self._redis.hget(key, "state")
+            return val or None
+        except Exception:
+            # Legacy string key — read its value and migrate
+            try:
+                val = await self._redis.get(key)
+                if val:
+                    await self._redis.delete(key)
+                    await self._redis.hset(key, mapping={"state": val, "ts": str(int(time.time()))})
+                    await self._redis.expire(key, self._SESSION_TTL)
+                    return val
+            except Exception:
+                pass
+            return None
 
     async def get_session_info(self, chat_id: str) -> Dict[str, str]:
         """Get full session info hash."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
-        data = await self._redis.hgetall(key)
-        return data if isinstance(data, dict) else {}
+        try:
+            data = await self._redis.hgetall(key)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            # Legacy string key
+            return {}
 
     async def get_all_tracked_sessions(self) -> Dict[str, Dict[str, str]]:
         """Scan all tracked sessions. Returns {chat_id: {state, dialog_id, ...}}."""
@@ -182,7 +219,23 @@ class Storage:
         prefix = self._SESSION_PREFIX
         async for key in self._redis.scan_iter(match=f"{prefix}*", count=100):
             chat_id = key[len(prefix):]
-            data = await self._redis.hgetall(key)
-            if isinstance(data, dict) and data.get("state"):
-                result[chat_id] = data
+            try:
+                data = await self._redis.hgetall(key)
+                if isinstance(data, dict) and data.get("state"):
+                    result[chat_id] = data
+                    continue
+            except Exception:
+                pass
+            # Legacy string key — try to read and migrate
+            try:
+                val = await self._redis.get(key)
+                if val and isinstance(val, str):
+                    await self._redis.delete(key)
+                    mapping = {"state": val, "ts": str(int(time.time()))}
+                    await self._redis.hset(key, mapping=mapping)
+                    await self._redis.expire(key, self._SESSION_TTL)
+                    result[chat_id] = mapping
+                    log.info("session_key_migrated", extra={"chat_id": chat_id, "old_state": val})
+            except Exception:
+                pass
         return result
