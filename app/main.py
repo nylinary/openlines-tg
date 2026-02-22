@@ -480,7 +480,10 @@ async def _extract_voice_text(
     # Fallback: download via REST API by file ID
     if not audio_bytes and voice_file_id:
         try:
-            audio_bytes = await bitrix.download_file_by_id(voice_file_id)
+            audio_bytes = await bitrix.download_file_by_id(
+                voice_file_id,
+                webhook_url=settings.b24_webhook_url or None,
+            )
             log.info("voice_download_by_id_ok", extra={
                 "dialog_id": dialog_id,
                 "file_id": voice_file_id,

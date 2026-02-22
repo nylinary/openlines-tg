@@ -122,17 +122,30 @@ class BitrixClient:
             })
             raise BitrixError(f"File download failed: {e}") from e
 
-    async def download_file_by_id(self, file_id: str) -> bytes:
+    async def download_file_by_id(
+        self,
+        file_id: str,
+        *,
+        webhook_url: Optional[str] = None,
+    ) -> bytes:
         """Download a Bitrix disk file by its ID using the REST API.
 
         Uses ``disk.file.get`` to retrieve file metadata including a
         direct download URL, then downloads the actual content.
         This is more reliable than using ``urlDownload`` from chat
         file attachments, which may return HTML wrapper pages.
+
+        Args:
+            file_id: Bitrix disk file ID.
+            webhook_url: If provided, use inbound webhook instead of OAuth.
+                         The webhook must have ``disk`` scope.
         """
         try:
             # Get file info with direct download link
-            resp = await self.call("disk.file.get", {"id": file_id})
+            if webhook_url:
+                resp = await self.call_webhook(webhook_url, "disk.file.get", {"id": file_id})
+            else:
+                resp = await self.call("disk.file.get", {"id": file_id})
             result = resp.get("result", {})
             if not isinstance(result, dict):
                 raise BitrixError(f"disk.file.get returned unexpected result: {resp}")
