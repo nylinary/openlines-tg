@@ -78,7 +78,12 @@ class BitrixClient:
             # instead of the raw file content
             download_url = download_url.replace("&humanRE=1", "").replace("humanRE=1&", "").replace("?humanRE=1", "?")
 
-            # If it's a Bitrix domain URL, ensure auth token is present
+            # If it's a Bitrix domain URL, ensure auth token is present.
+            # Note: The AJAX download endpoint (/bitrix/services/main/ajax.php)
+            # does NOT support REST API auth tokens — it requires session
+            # cookies. The auth= parameter only works on /rest/ endpoints.
+            # We still try it as a best-effort attempt; the fallback
+            # download_file_by_id() via disk.file.get is more reliable.
             if self.domain in download_url and "auth=" not in download_url:
                 try:
                     token = await self.ensure_token()
