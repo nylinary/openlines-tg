@@ -67,12 +67,16 @@ class BitrixClient:
         Bitrix file URLs may require auth.  If the URL is on the same
         domain, an access token query param is appended automatically.
 
-        Bitrix disk download URLs may contain ``humanRE=1`` which causes
+        Bitrix disk download URLs often contain ``humanRE=1`` which causes
         the server to return an HTML wrapper page instead of raw bytes.
-        We detect this and raise an error.
+        We strip this parameter before downloading.
         """
         try:
             download_url = url
+
+            # Strip humanRE=1 — it makes Bitrix return an HTML page
+            # instead of the raw file content
+            download_url = download_url.replace("&humanRE=1", "").replace("humanRE=1&", "").replace("?humanRE=1", "?")
 
             # If it's a Bitrix domain URL, ensure auth token is present
             if self.domain in download_url and "auth=" not in download_url:
