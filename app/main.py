@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
@@ -408,7 +409,6 @@ async def _extract_voice_text(
     if not stt:
         return None
 
-    # Bitrix sends FILES as a nested dict: FILES[id][name], FILES[id][urlDownload], etc.
     files_raw = params.get("FILES")
     if not files_raw or not isinstance(files_raw, dict):
         return None
@@ -419,7 +419,6 @@ async def _extract_voice_text(
     voice_name: str = "voice.ogg"
     voice_mime: str = ""
 
-    # files_raw can be {"0": {"name": ..., "urlDownload": ..., "type": ...}, "1": {...}}
     file_entries = files_raw.values() if isinstance(files_raw, dict) else []
     for f in file_entries:
         if not isinstance(f, dict):
@@ -427,9 +426,7 @@ async def _extract_voice_text(
         fname = str(f.get("name", "") or "")
         ftype = str(f.get("type", "") or "")
         fid = str(f.get("id", "") or "")
-        # Bitrix uses urlDownload / urlShow, not "link"
         flink = str(f.get("urlDownload", "") or f.get("urlShow", "") or f.get("link", "") or "")
-        # Bitrix includes viewerAttrs.viewerType == "audio" for voice/audio
         viewer_attrs = f.get("viewerAttrs") or {}
         viewer_type = str(viewer_attrs.get("viewerType", "") or "") if isinstance(viewer_attrs, dict) else ""
 
@@ -462,15 +459,9 @@ async def _extract_voice_text(
         "url": voice_url[:100] if voice_url else "",
     })
 
-    # Download the audio file.
-    # Strategy 1: use the event auth token to call disk.file.get on the
-    #             event's domain.  This is the most reliable approach
-    #             because the event token has the correct user context.
-    # Strategy 2: direct URL download (urlDownload from the event payload).
-    # Strategy 3: REST API disk.file.get via webhook (fallback).
     audio_bytes: Optional[bytes] = None
 
-    # Strategy 1: event auth token → disk.file.get
+    # Strategy 1: event auth token → disk.file.get (best, if token present)
     if not audio_bytes and voice_file_id and event_auth:
         event_token = str(event_auth.get("access_token", "") or "")
         event_domain = str(event_auth.get("domain", "") or "")
@@ -494,8 +485,74 @@ async def _extract_voice_text(
                     "domain": event_domain,
                     "error": str(e),
                 })
+        else:
+            # OpenLines connector events sometimes omit access_token and only include member/application_token.
+            log.info("voice_event_auth_missing_access_token", extra={
+                "dialog_id": dialog_id,
+                "has_auth": True,
+                "auth_keys": sorted(list(event_auth.keys())) if isinstance(event_auth, dict) else [],
+            })
 
-    # Strategy 2: direct URL download
+    # Strategy 1b: call disk.file.get on the event domain using our stored OAuth token
+    # (works when Bitrix doesn't provide auth.access_token in connector events).
+    if not audio_bytes and voice_file_id and event_auth:
+        event_domain = str(event_auth.get("domain", "") or "").strip()
+        client_endpoint = str(event_auth.get("client_endpoint", "") or "").strip()
+        domain = event_domain
+        if not domain and client_endpoint:
+            try:
+                domain = urlparse(client_endpoint).netloc
+            except Exception:
+                domain = ""
+
+        if domain:
+            try:
+                token = await bitrix.ensure_token()
+                from .bitrix import _redact_bitrix_url  # type: ignore
+
+                meta_url = f"https://{domain}/rest/disk.file.get.json?auth={token}"
+                log.info("voice_download_domain_oauth_meta", extra={
+                    "dialog_id": dialog_id,
+                    "file_id": voice_file_id,
+                    "domain": domain,
+                    "url": _redact_bitrix_url(meta_url)[:120],
+                })
+
+                r = await bitrix._client.post(meta_url, data={"id": voice_file_id})
+                payload = r.json() if r.text else {}
+                if isinstance(payload, dict) and payload.get("error"):
+                    raise BitrixError(f"{payload.get('error')}: {payload.get('error_description', '')}")
+
+                result = payload.get("result", {})
+                if not isinstance(result, dict):
+                    raise BitrixError(f"Unexpected disk.file.get result: {payload}")
+
+                dl_url = str(result.get("DOWNLOAD_URL", "") or "")
+                if not dl_url:
+                    raise BitrixError("disk.file.get returned no DOWNLOAD_URL")
+
+                r2 = await bitrix._client.get(dl_url, follow_redirects=True)
+                r2.raise_for_status()
+                ct = r2.headers.get("content-type", "")
+                if "text/html" in ct:
+                    raise BitrixError(f"DOWNLOAD_URL returned HTML (content-type: {ct})")
+
+                audio_bytes = r2.content
+                log.info("voice_download_domain_oauth_ok", extra={
+                    "dialog_id": dialog_id,
+                    "file_id": voice_file_id,
+                    "domain": domain,
+                    "size_bytes": len(audio_bytes) if audio_bytes else 0,
+                })
+            except Exception as e:
+                log.warning("voice_download_domain_oauth_failed", extra={
+                    "dialog_id": dialog_id,
+                    "file_id": voice_file_id,
+                    "domain": domain,
+                    "error": str(e),
+                })
+
+    # Strategy 2: direct URL download (often returns HTML wrapper)
     if not audio_bytes and voice_url:
         try:
             audio_bytes = await bitrix.download_file(voice_url)
@@ -506,7 +563,7 @@ async def _extract_voice_text(
                 "url": voice_url[:100],
             })
 
-    # Strategy 3: download via REST API by file ID (webhook)
+    # Strategy 3: disk.file.get via webhook (may be ACCESS_DENIED)
     if not audio_bytes and voice_file_id:
         try:
             audio_bytes = await bitrix.download_file_by_id(
