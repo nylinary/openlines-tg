@@ -285,7 +285,7 @@ async def _send_bot_message(
         log.warning("imbot_msg_failed", extra={"error": str(e), "dialog_id": dialog_id})
 
 
-async def _transfer_to_operator(
+async def _do_transfer(
     bitrix: BitrixClient,
     settings: Settings,
     dialog_id: str,
@@ -301,10 +301,6 @@ async def _transfer_to_operator(
         await _send_bot_message(bitrix, settings, dialog_id,
                                 "Не удалось перевести на оператора — отсутствует идентификатор чата.")
         return
-
-    # Notify user first
-    await _send_bot_message(bitrix, settings, dialog_id,
-                            "Перевожу вас на оператора, подождите...")
 
     try:
         resp = await _call_b24(bitrix, settings, "imopenlines.bot.session.operator", {
@@ -384,15 +380,18 @@ async def b24_imbot_events(
         if ai_chat is not None:
             reply_text, transfer = await ai_chat.handle_message(dialog_id, text)
 
+            # Always send the reply (GPT writes a friendly message even on transfer)
+            await _send_bot_message(bitrix, settings, dialog_id, reply_text)
+
             if transfer:
-                # AI detected operator request — transfer
-                await _transfer_to_operator(bitrix, settings, dialog_id, chat_id)
-            else:
-                await _send_bot_message(bitrix, settings, dialog_id, reply_text)
+                # AI detected operator intent — hand off after sending the reply
+                await _do_transfer(bitrix, settings, dialog_id, chat_id)
         else:
             # No AI configured — fall back to keyword check + echo
             if text.lower() in ("оператор", "operator"):
-                await _transfer_to_operator(bitrix, settings, dialog_id, chat_id)
+                await _send_bot_message(bitrix, settings, dialog_id,
+                                        "Перевожу вас на оператора, подождите... 👤")
+                await _do_transfer(bitrix, settings, dialog_id, chat_id)
             else:
                 await _send_bot_message(bitrix, settings, dialog_id, f"echo: {text}")
 

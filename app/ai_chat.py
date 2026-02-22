@@ -61,9 +61,14 @@ SYSTEM_PROMPT = """Ты — AI-консультант интернет-мага�
 3. Если запрос неоднозначный — задай уточняющий вопрос.
 4. Если товара нет в наличии — предложи аналоги из той же категории.
 5. Всегда указывай цену в рублях и ссылку на товар, если есть.
-6. Если покупатель хочет связаться с оператором — скажи, что переводишь на оператора.
-7. Не придумывай товары, которых нет в каталоге. Если не нашёл — так и скажи.
-8. Формат ответа: только обычный текст. НЕ используй Markdown-разметку (жирный, курсив, заголовки, списки с *, ссылки []() и т.д.) — Bitrix IM её не поддерживает.
+6. Не придумывай товары, которых нет в каталоге. Если не нашёл — так и скажи.
+7. Формат ответа: только обычный текст. НЕ используй Markdown-разметку (жирный, курсив, заголовки, списки с *, ссылки []() и т.д.) — Bitrix IM её не поддерживает.
+
+ВАЖНО — перевод на оператора:
+Если покупатель хочет поговорить с живым человеком, оператором, менеджером, оформить заказ, купить, сделать заказ, или любым другим образом выражает намерение, что ему нужен реальный человек, а не бот — начни свой ответ СТРОГО с метки [TRANSFER] (именно так, в квадратных скобках, в самом начале сообщения, отдельной строкой).
+После метки [TRANSFER] напиши дружелюбное сообщение клиенту, что переводишь его на оператора.
+Примеры ситуаций для [TRANSFER]: "хочу заказать", "можно оформить?", "давайте закажу", "есть живой человек?", "хочу купить", "а можно с менеджером поговорить?", "сделайте заказ", "оформите доставку" и т.п.
+Если покупатель просто спрашивает о товарах, ценах, наличии — это НЕ повод для перевода, отвечай сам.
 
 FAQ — частые вопросы:
 - Адрес: Москва (точный адрес уточняйте у оператора или на сайте myryba.ru)
@@ -113,17 +118,7 @@ class AIChatHandler:
 
     # --- Intent detection (lightweight, before GPT) ---
 
-    @staticmethod
-    def detect_operator_request(text: str) -> bool:
-        """Check if the user wants to talk to a human operator."""
-        lower = text.lower().strip()
-        operator_keywords = [
-            "оператор", "operator", "менеджер", "человек",
-            "позовите оператора", "переведите на оператора",
-            "живой оператор", "связаться с оператором",
-            "хочу оператора", "нужен оператор",
-        ]
-        return any(kw in lower for kw in operator_keywords)
+    _TRANSFER_TAG_RE = re.compile(r"^\s*\[TRANSFER\]\s*", re.IGNORECASE)
 
     @staticmethod
     def detect_product_search(text: str) -> Optional[str]:
@@ -167,11 +162,7 @@ class AIChatHandler:
         Returns:
             (response_text, transfer_to_operator)
         """
-        # 1. Check for operator transfer request
-        if self.detect_operator_request(user_text):
-            return ("Перевожу вас на оператора, подождите... 👤", True)
-
-        # 2. Search for relevant products to enrich the GPT context
+        # 1. Search for relevant products to enrich the GPT context
         search_query = self.detect_product_search(user_text)
         product_context = ""
 
@@ -185,7 +176,7 @@ class AIChatHandler:
             if found:
                 product_context = self._format_search_results(found)
 
-        # 3. Build messages for GPT
+        # 2. Build messages for GPT
         system_prompt = self._get_system_prompt()
 
         messages: List[Dict[str, str]] = [
@@ -207,7 +198,7 @@ class AIChatHandler:
 
         messages.append({"role": "user", "text": user_message})
 
-        # 4. Call LLM
+        # 3. Call LLM
         try:
             reply = await self.gpt.completion(messages)
         except LLMError as e:
@@ -217,14 +208,21 @@ class AIChatHandler:
                 "Попробуйте ещё раз или напишите «оператор» для связи с менеджером."
             )
 
-        # 4b. Strip Markdown — GPT may still produce it despite the prompt
+        # 3b. Strip Markdown — GPT may still produce it despite the prompt
         reply = _strip_markdown(reply)
+
+        # 4. Detect [TRANSFER] tag in GPT reply → operator transfer
+        transfer = False
+        if self._TRANSFER_TAG_RE.search(reply):
+            transfer = True
+            reply = self._TRANSFER_TAG_RE.sub("", reply).strip()
+            log.info("ai_transfer_detected", extra={"dialog_id": dialog_id})
 
         # 5. Save messages to history
         await self._save_message(dialog_id, "user", user_text)
         await self._save_message(dialog_id, "assistant", reply)
 
-        return (reply, False)
+        return (reply, transfer)
 
     def _format_search_results(self, products: List[Dict[str, Any]]) -> str:
         """Format product search results for inclusion in GPT context."""
