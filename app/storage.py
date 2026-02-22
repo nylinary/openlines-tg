@@ -119,3 +119,29 @@ class Storage:
         """Clear conversation history for a dialog."""
         key = f"{self._CHAT_HISTORY_PREFIX}{dialog_id}"
         await self._redis.delete(key)
+
+    # --- Bot session state tracking ---
+
+    _SESSION_PREFIX = "bot:session:"
+    _SESSION_TTL = 7 * 24 * 3600  # 7 days
+
+    async def mark_session_transferred(self, chat_id: str) -> None:
+        """Mark that the bot transferred this chat to an operator."""
+        key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._redis.set(key, "transferred", ex=self._SESSION_TTL)
+
+    async def mark_session_active(self, chat_id: str) -> None:
+        """Mark that the bot is active in this chat."""
+        key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._redis.set(key, "bot_active", ex=self._SESSION_TTL)
+
+    async def mark_session_closed(self, chat_id: str) -> None:
+        """Mark that the bot was removed from this chat (session closed or operator took over)."""
+        key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._redis.set(key, "closed", ex=self._SESSION_TTL)
+
+    async def get_session_state(self, chat_id: str) -> Optional[str]:
+        """Get the current session state: 'bot_active', 'transferred', 'closed', or None."""
+        key = f"{self._SESSION_PREFIX}{chat_id}"
+        val = await self._redis.get(key)
+        return val or None

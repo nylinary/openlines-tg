@@ -92,6 +92,9 @@ async def _startup() -> None:
     # --- Background scraper task ---
     app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
 
+    # --- Background session watchdog (safety net for orphaned OL sessions) ---
+    app.state.watchdog_task = asyncio.create_task(_session_watchdog(settings))
+
     log.info(
         "startup_complete",
         extra={
@@ -106,14 +109,15 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    # Cancel background scraper
-    task = getattr(app.state, "scraper_task", None)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    # Cancel background tasks
+    for task_name in ("scraper_task", "watchdog_task"):
+        task = getattr(app.state, task_name, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     for key in ("llm_provider", "bitrix", "storage", "db"):
         obj = getattr(app.state, key, None)
@@ -179,6 +183,65 @@ async def _scraper_loop(settings: Settings, catalog: ProductCatalog) -> None:
 
         # Sleep for a short interval, then re-check
         await asyncio.sleep(60)
+
+
+async def _session_watchdog(settings: Settings) -> None:
+    """Background safety-net: periodically check for orphaned OL sessions.
+
+    Polls ``imopenlines.session.list`` for sessions that are closed/waiting
+    but not assigned to our bot.  If found, logs a warning.
+
+    In practice this should never fire if the Bitrix Open Line is configured
+    correctly ("assign chatbot on repeat message"), because Bitrix itself
+    re-assigns the bot when the client writes again.  This watchdog exists
+    purely as a diagnostic/monitoring tool.
+
+    Interval: every 5 minutes.
+    """
+    await asyncio.sleep(30)  # let startup finish
+
+    while True:
+        try:
+            bitrix: BitrixClient = app.state.bitrix
+            bot_id = settings.b24_imbot_id
+
+            # Try listing recent OL sessions
+            resp = await _call_b24(bitrix, settings, "imopenlines.session.list", {
+                "LIMIT": 20,
+            })
+            sessions = resp.get("result", [])
+            if not isinstance(sessions, list):
+                sessions = []
+
+            for s in sessions:
+                if not isinstance(s, dict):
+                    continue
+                status = s.get("STATUS")
+                operator_id = s.get("OPERATOR_ID")
+                chat_id = s.get("CHAT_ID")
+                session_id = s.get("ID")
+
+                # Session is closed/finished and not assigned to our bot
+                if status in ("closed", "finish", "0") and operator_id != str(bot_id):
+                    log.info(
+                        "watchdog_orphaned_session",
+                        extra={
+                            "session_id": session_id,
+                            "chat_id": chat_id,
+                            "status": status,
+                            "operator_id": operator_id,
+                            "bot_id": bot_id,
+                        },
+                    )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Don't crash the watchdog — imopenlines.session.list may not
+            # be available on all Bitrix plans or with all scopes.
+            log.debug("watchdog_error", extra={"error": str(e)})
+
+        await asyncio.sleep(300)  # every 5 min
 
 
 # ---------------------------------------------------------------------------
@@ -319,14 +382,24 @@ async def b24_imbot_events(
     settings: Settings = Depends(settings_dep),
     bitrix: BitrixClient = Depends(bitrix_dep),
     ai_chat: Optional[AIChatHandler] = Depends(ai_chat_dep),
+    storage: Storage = Depends(storage_dep),
 ) -> Dict[str, str]:
     """Receive events from Bitrix for the UI-registered bot.
 
-    Bitrix sends bot events as **form-encoded** POST
-    (``application/x-www-form-urlencoded``), not JSON.
+    Bitrix sends bot events as ``application/x-www-form-urlencoded``.
 
-    Routes messages through the AI chat handler (if configured)
-    or falls back to echo mode.
+    Handled events:
+
+    * **ONIMBOTMESSAGEADD** — user sent a message → AI response
+    * **ONIMBOTJOINCHAT**   — bot (re-)added to a chat.  Happens when:
+      - a new OL session starts,
+      - the client writes again after operator closed the previous session
+        (if Open Line is configured with "assign chatbot on repeat message").
+      We clear stale conversation history so the bot starts fresh.
+    * **ONIMBOTDELETE**     — bot removed from a chat.  Happens when:
+      - operator takes over (after our ``imopenlines.bot.session.operator``),
+      - operator closes the dialog.
+      We log the removal and update session state.
     """
     try:
         content_type = request.headers.get("content-type", "")
@@ -334,13 +407,12 @@ async def b24_imbot_events(
         if "json" in content_type:
             payload: Dict[str, Any] = await request.json()
         else:
-            # form-encoded (the normal Bitrix bot event format)
             raw_form = await request.form()
             payload = _parse_nested_form(dict(raw_form))
 
         log.info("imbot_event_received", extra={"payload": payload})
 
-        event = payload.get("event", "")
+        event = str(payload.get("event", "")).upper()
 
         # Extract params — Bitrix nests them under data.PARAMS
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -349,8 +421,10 @@ async def b24_imbot_events(
         dialog_id = params.get("DIALOG_ID") if isinstance(params, dict) else None
         message = params.get("MESSAGE") if isinstance(params, dict) else None
         chat_id = params.get("TO_CHAT_ID") if isinstance(params, dict) else None
+        # ONIMBOTJOINCHAT sends CHAT_ID at top-level PARAMS
+        if not chat_id:
+            chat_id = params.get("CHAT_ID") if isinstance(params, dict) else None
 
-        # Bitrix also sends auth context — useful for logging
         auth = payload.get("auth") if isinstance(payload, dict) else None
 
         log.info(
@@ -364,6 +438,17 @@ async def b24_imbot_events(
             },
         )
 
+        # ----- ONIMBOTJOINCHAT: bot (re-)joined a chat -----
+        if event == "ONIMBOTJOINCHAT":
+            await _handle_bot_join(storage, settings, bitrix, dialog_id, chat_id)
+            return {"ok": "true"}
+
+        # ----- ONIMBOTDELETE: bot removed from a chat -----
+        if event == "ONIMBOTDELETE":
+            await _handle_bot_delete(storage, dialog_id, chat_id)
+            return {"ok": "true"}
+
+        # ----- ONIMBOTMESSAGEADD: user sent a message -----
         if not isinstance(dialog_id, str) or not dialog_id:
             log.info("imbot_event_ignored", extra={"reason": "no_dialog_id"})
             return {"ok": "true"}
@@ -376,6 +461,10 @@ async def b24_imbot_events(
             log.info("imbot_event_ignored", extra={"reason": "empty_message"})
             return {"ok": "true"}
 
+        # Track that bot is active in this chat
+        if chat_id:
+            await storage.mark_session_active(chat_id)
+
         # --- AI-powered response (or echo fallback) ---
         if ai_chat is not None:
             reply_text, transfer = await ai_chat.handle_message(dialog_id, text)
@@ -385,12 +474,16 @@ async def b24_imbot_events(
 
             if transfer:
                 # AI detected operator intent — hand off after sending the reply
+                if chat_id:
+                    await storage.mark_session_transferred(chat_id)
                 await _do_transfer(bitrix, settings, dialog_id, chat_id)
         else:
             # No AI configured — fall back to keyword check + echo
             if text.lower() in ("оператор", "operator"):
                 await _send_bot_message(bitrix, settings, dialog_id,
                                         "Перевожу вас на оператора, подождите... 👤")
+                if chat_id:
+                    await storage.mark_session_transferred(chat_id)
                 await _do_transfer(bitrix, settings, dialog_id, chat_id)
             else:
                 await _send_bot_message(bitrix, settings, dialog_id, f"echo: {text}")
@@ -399,6 +492,75 @@ async def b24_imbot_events(
         log.exception("imbot_event_handler_error", extra={"error": str(e)})
 
     return {"ok": "true"}
+
+
+# ---------------------------------------------------------------------------
+# Bot lifecycle event handlers
+# ---------------------------------------------------------------------------
+
+
+async def _handle_bot_join(
+    storage: Storage,
+    settings: Settings,
+    bitrix: BitrixClient,
+    dialog_id: Optional[str],
+    chat_id: Optional[str],
+) -> None:
+    """Handle ONIMBOTJOINCHAT — bot was (re-)added to a chat.
+
+    This fires when:
+    - A brand-new Open Line session starts (first client message).
+    - The client writes again after the operator previously closed the dialog
+      (Bitrix Open Line setting: "assign chatbot on repeat message").
+
+    We check if this is a **returning** session (the bot was previously
+    removed after a transfer) and clear stale conversation history so
+    the AI starts fresh without context from the operator conversation.
+    """
+    log.info("bot_join_chat", extra={"dialog_id": dialog_id, "chat_id": chat_id})
+
+    prev_state: Optional[str] = None
+    if chat_id:
+        prev_state = await storage.get_session_state(chat_id)
+        await storage.mark_session_active(chat_id)
+
+    # If the previous state was "transferred" or "closed", this is a
+    # returning session after operator close → clear old AI history.
+    if prev_state in ("transferred", "closed"):
+        if dialog_id:
+            await storage.clear_chat_history(dialog_id)
+            log.info(
+                "bot_rejoin_history_cleared",
+                extra={
+                    "dialog_id": dialog_id,
+                    "chat_id": chat_id,
+                    "prev_state": prev_state,
+                },
+            )
+
+
+async def _handle_bot_delete(
+    storage: Storage,
+    dialog_id: Optional[str],
+    chat_id: Optional[str],
+) -> None:
+    """Handle ONIMBOTDELETE — bot was removed from a chat.
+
+    This fires when:
+    - Our bot called ``imopenlines.bot.session.operator`` (transfer to operator).
+    - The operator closed the dialog.
+    - Session auto-closed by timeout.
+
+    We mark the session as "closed" so that on the next ONIMBOTJOINCHAT
+    we know to clear history and start fresh.
+    """
+    log.info("bot_delete_chat", extra={"dialog_id": dialog_id, "chat_id": chat_id})
+
+    if chat_id:
+        # Only overwrite if not already "transferred" (which we set ourselves)
+        cur = await storage.get_session_state(chat_id)
+        if cur != "transferred":
+            await storage.mark_session_closed(chat_id)
 
 
 # ---------------------------------------------------------------------------
