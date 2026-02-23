@@ -663,20 +663,37 @@ async def b24_imbot_events(
             return {"ok": "true"}
 
         # --- Filter out messages sent by the operator (not the client) ---
-        # In OpenLines, the Telegram client's messages always have FROM_CONNECTOR
-        # set (e.g. "telegrambot"). Operator messages sent through the CRM UI
-        # do NOT have FROM_CONNECTOR. We only want to process client messages.
-        from_connector = str(params.get("FROM_CONNECTOR", "") or "") if isinstance(params, dict) else ""
-        sender_id = str(params.get("USER_ID", "") or "") if isinstance(params, dict) else ""
+        # Bitrix does NOT send FROM_CONNECTOR in PARAMS for OpenLines events.
+        # Instead, distinguish by data.USER block:
+        #   client (Telegram/connector): IS_CONNECTOR="Y", IS_EXTRANET="Y"
+        #   operator (CRM user):         IS_CONNECTOR="N", IS_EXTRANET="N"
+        # Sender ID is in PARAMS.AUTHOR_ID (or PARAMS.FROM_USER_ID as fallback).
+        user_block = data.get("USER") if isinstance(data, dict) else {}
+        if not isinstance(user_block, dict):
+            user_block = {}
+
+        is_connector = str(user_block.get("IS_CONNECTOR", "") or "").upper()
+        is_bot_user  = str(user_block.get("IS_BOT", "") or "").upper()
+        sender_id    = str(
+            (params.get("AUTHOR_ID") or params.get("FROM_USER_ID") or "")
+            if isinstance(params, dict) else ""
+        )
         bot_id_str = str(settings.b24_imbot_id)
 
-        if sender_id == bot_id_str:
-            # Message from the bot itself — never process (shouldn't happen but guard anyway)
+        log.info("imbot_sender_info", extra={
+            "dialog_id": dialog_id,
+            "sender_id": sender_id,
+            "is_connector": is_connector,
+            "is_bot_user": is_bot_user,
+        })
+
+        if sender_id == bot_id_str or is_bot_user == "Y":
+            # Message from the bot itself — never process
             log.info("imbot_event_ignored", extra={"reason": "sender_is_bot", "sender_id": sender_id})
             return {"ok": "true"}
 
-        if not from_connector:
-            # No connector → message from an internal CRM user (operator), not the client
+        if is_connector != "Y":
+            # Sender is an internal CRM operator, not an external connector client
             log.info("imbot_event_ignored", extra={
                 "reason": "sender_is_operator",
                 "sender_id": sender_id,
