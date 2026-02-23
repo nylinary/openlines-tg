@@ -352,6 +352,59 @@ async def _send_bot_message(
         log.warning("imbot_msg_failed", extra={"error": str(e), "dialog_id": dialog_id})
 
 
+async def _get_operator_name(
+    bitrix: BitrixClient,
+    settings: Settings,
+    chat_id: str,
+) -> Optional[str]:
+    """Return the display name of the human operator currently in the chat.
+
+    Calls ``im.chat.get`` and finds the first non-bot, non-external member
+    whose ID is not the bot itself.
+    """
+    try:
+        resp = await _call_b24(bitrix, settings, "im.chat.get", {"CHAT_ID": chat_id})
+        result = resp.get("result", {})
+        if not isinstance(result, dict):
+            return None
+
+        # ``USERS`` is a list of user-info dicts in newer API versions,
+        # or a flat dict keyed by user_id in older ones.
+        users = result.get("USERS") or result.get("users")
+        bot_id_str = str(settings.b24_imbot_id)
+
+        if isinstance(users, list):
+            for u in users:
+                if not isinstance(u, dict):
+                    continue
+                uid = str(u.get("ID") or u.get("id") or "")
+                if uid == bot_id_str:
+                    continue
+                if str(u.get("IS_BOT", "") or "").upper() == "Y":
+                    continue
+                if str(u.get("IS_EXTRANET", "") or "").upper() == "Y":
+                    continue
+                name = str(u.get("NAME") or u.get("name") or "").strip()
+                if name:
+                    return name
+        elif isinstance(users, dict):
+            for uid, u in users.items():
+                if uid == bot_id_str:
+                    continue
+                if not isinstance(u, dict):
+                    continue
+                if str(u.get("IS_BOT", "") or "").upper() == "Y":
+                    continue
+                if str(u.get("IS_EXTRANET", "") or "").upper() == "Y":
+                    continue
+                name = str(u.get("NAME") or u.get("name") or "").strip()
+                if name:
+                    return name
+    except Exception as e:
+        log.warning("get_operator_name_failed", extra={"chat_id": chat_id, "error": str(e)})
+    return None
+
+
 async def _do_transfer(
     bitrix: BitrixClient,
     settings: Settings,
@@ -360,8 +413,10 @@ async def _do_transfer(
 ) -> None:
     """Transfer the conversation to a free human operator.
 
-    Uses ``imopenlines.bot.session.operator`` which requires ``CHAT_ID``
-    (the internal openlines chat id, sent by Bitrix as ``TO_CHAT_ID``).
+    Uses ``imopenlines.bot.session.operator`` which requires ``CHAT_ID``.
+    If an operator is already present in the chat the call will fail — in
+    that case we look up the operator's name and notify the client instead
+    of showing a generic error.
     """
     if not chat_id:
         log.warning("transfer_no_chat_id", extra={"dialog_id": dialog_id})
@@ -376,8 +431,18 @@ async def _do_transfer(
         log.info("transfer_to_operator_ok", extra={"chat_id": chat_id, "response": resp.get("result")})
     except Exception as e:
         log.warning("transfer_to_operator_failed", extra={"error": str(e), "chat_id": chat_id})
-        await _send_bot_message(bitrix, settings, dialog_id,
-                                "Не удалось перевести на оператора. Попробуйте позже.")
+        # Operator is likely already in the chat — find their name and notify the client
+        operator_name = await _get_operator_name(bitrix, settings, chat_id)
+        if operator_name:
+            await _send_bot_message(
+                bitrix, settings, dialog_id,
+                f"Оператор {operator_name} уже подключён к чату и скоро вам ответит 👤",
+            )
+        else:
+            await _send_bot_message(
+                bitrix, settings, dialog_id,
+                "Оператор уже подключён к чату и скоро вам ответит 👤",
+            )
 
 
 # ---------------------------------------------------------------------------
