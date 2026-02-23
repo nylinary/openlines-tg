@@ -192,48 +192,60 @@ async def _scraper_loop(settings: Settings, catalog: ProductCatalog) -> None:
 
 
 async def _session_watchdog(settings: Settings) -> None:
-    """Background safety-net: auto-close orphaned transferred sessions.
+    """Background safety-net: resume bot after operator goes silent.
 
-    Scans sessions marked as ``transferred`` in Redis.  When a transferred
-    session has been idle for >2 minutes (operator likely closed it or
-    we missed the ONIMBOTDELETE event), marks it as ``closed``.
-    The next ``ONIMBOTJOINCHAT`` event will clear history and start fresh.
+    Scans sessions marked as ``transferred`` in Redis.  When the operator
+    has not written anything for ``OPERATOR_TIMEOUT_S`` seconds, the bot
+    resumes answering (state → ``bot_active``).  If Bitrix later sends
+    ONIMBOTDELETE (operator actually took over and closed), that will
+    flip the state to ``closed`` and the next ONIMBOTJOINCHAT clears history.
 
-    Note: ``imopenlines.session.list`` does NOT exist in Bitrix24 REST API,
-    so we rely solely on Redis state + bot lifecycle events
-    (ONIMBOTJOINCHAT / ONIMBOTDELETE) for session tracking.
-
-    Interval: every 2 minutes.
+    Interval: every 60 seconds.
     """
     await asyncio.sleep(30)  # let startup finish
 
     while True:
         try:
             storage: Storage = app.state.storage
+            bitrix: BitrixClient = app.state.bitrix
+            cur_settings: Settings = app.state.settings
 
             import time as _t
             now = _t.time()
+            timeout = cur_settings.operator_timeout_s
             tracked = await storage.get_all_tracked_sessions()
             for chat_id, info in tracked.items():
                 state = info.get("state", "")
                 ts = float(info.get("ts", "0") or "0")
+                dialog_id = info.get("dialog_id", "")
 
-                # Session was transferred to operator >2 min ago and not yet
-                # marked closed → operator may have closed it without us
-                # getting an ONIMBOTDELETE event.
-                if state == "transferred" and ts > 0 and (now - ts) > 120:
-                    await storage.mark_session_closed(chat_id)
-                    log.info("watchdog_transferred_to_closed", extra={
+                if state == "transferred" and ts > 0 and (now - ts) > timeout:
+                    await storage.mark_session_active(chat_id)
+                    log.info("watchdog_operator_timeout_bot_resumed", extra={
                         "chat_id": chat_id,
+                        "dialog_id": dialog_id,
                         "age_s": round(now - ts),
+                        "timeout_s": timeout,
                     })
+                    # Notify the client that the bot is back
+                    if dialog_id:
+                        try:
+                            await _send_bot_message(
+                                bitrix, cur_settings, dialog_id,
+                                "Оператор сейчас недоступен. Я снова на связи — чем могу помочь? 🤖",
+                            )
+                        except Exception as e:
+                            log.warning("watchdog_notify_failed", extra={
+                                "dialog_id": dialog_id,
+                                "error": str(e),
+                            })
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning("watchdog_loop_error", extra={"error": str(e)})
 
-        await asyncio.sleep(120)  # every 2 min
+        await asyncio.sleep(60)  # check every minute
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +662,46 @@ async def b24_imbot_events(
             log.info("imbot_event_ignored", extra={"reason": "no_dialog_id"})
             return {"ok": "true"}
 
+        # --- Filter out messages sent by the operator (not the client) ---
+        # In OpenLines, the Telegram client's messages always have FROM_CONNECTOR
+        # set (e.g. "telegrambot"). Operator messages sent through the CRM UI
+        # do NOT have FROM_CONNECTOR. We only want to process client messages.
+        from_connector = str(params.get("FROM_CONNECTOR", "") or "") if isinstance(params, dict) else ""
+        sender_id = str(params.get("USER_ID", "") or "") if isinstance(params, dict) else ""
+        bot_id_str = str(settings.b24_imbot_id)
+
+        if sender_id == bot_id_str:
+            # Message from the bot itself — never process (shouldn't happen but guard anyway)
+            log.info("imbot_event_ignored", extra={"reason": "sender_is_bot", "sender_id": sender_id})
+            return {"ok": "true"}
+
+        if not from_connector:
+            # No connector → message from an internal CRM user (operator), not the client
+            log.info("imbot_event_ignored", extra={
+                "reason": "sender_is_operator",
+                "sender_id": sender_id,
+                "dialog_id": dialog_id,
+            })
+            return {"ok": "true"}
+
+        # --- Check session state: if operator is handling, stay silent ---
+        session_state: Optional[str] = None
+        if chat_id:
+            session_state = await storage.get_session_state(chat_id)
+
+        if session_state == "transferred":
+            # Operator is active — update the transfer timestamp so the watchdog
+            # timer resets (operator is still engaged as long as client keeps writing).
+            # We do NOT reply.
+            if chat_id:
+                await storage.mark_session_transferred_full(chat_id, dialog_id=dialog_id or "")
+            log.info("imbot_event_ignored", extra={
+                "reason": "operator_active",
+                "chat_id": chat_id,
+                "dialog_id": dialog_id,
+            })
+            return {"ok": "true"}
+
         if not isinstance(message, str):
             message = ""
 
@@ -714,7 +766,7 @@ async def b24_imbot_events(
             if transfer:
                 # AI detected operator intent — hand off after sending the reply
                 if chat_id:
-                    await storage.mark_session_transferred(chat_id)
+                    await storage.mark_session_transferred_full(chat_id, dialog_id=dialog_id)
                 await _do_transfer(bitrix, settings, dialog_id, chat_id)
         else:
             # No AI configured — fall back to keyword check + echo
@@ -722,7 +774,7 @@ async def b24_imbot_events(
                 await _send_bot_message(bitrix, settings, dialog_id,
                                         "Перевожу вас на оператора, подождите... 👤")
                 if chat_id:
-                    await storage.mark_session_transferred(chat_id)
+                    await storage.mark_session_transferred_full(chat_id, dialog_id=dialog_id)
                 await _do_transfer(bitrix, settings, dialog_id, chat_id)
             else:
                 await _send_bot_message(bitrix, settings, dialog_id, f"echo: {text}")
@@ -782,7 +834,6 @@ async def _handle_bot_join(
                 },
             )
 
-
 async def _handle_bot_delete(
     storage: Storage,
     dialog_id: Optional[str],
@@ -790,21 +841,25 @@ async def _handle_bot_delete(
 ) -> None:
     """Handle ONIMBOTDELETE — bot was removed from a chat.
 
-    This fires when:
-    - Our bot called ``imopenlines.bot.session.operator`` (transfer to operator).
-    - The operator closed the dialog.
-    - Session auto-closed by timeout.
-
-    We mark the session as "closed" so that on the next ONIMBOTJOINCHAT
-    we know to clear history and start fresh.
+    Two cases:
+    - We called ``imopenlines.bot.session.operator`` → operator took over.
+      State was already set to ``transferred`` by us. Leave it as-is so the
+      watchdog timer is already running.
+    - Operator closed the dialog → state was ``transferred`` or ``bot_active``.
+      Mark as ``closed`` so next ONIMBOTJOINCHAT clears history.
     """
     log.info("bot_delete_chat", extra={"dialog_id": dialog_id, "chat_id": chat_id})
 
     if chat_id:
-        # Only overwrite if not already "transferred" (which we set ourselves)
         cur = await storage.get_session_state(chat_id)
-        if cur != "transferred":
+        if cur == "transferred":
+            # Bot was removed because operator took over — keep ``transferred``
+            # so the watchdog knows when to resume.
+            log.info("bot_delete_operator_took_over", extra={"chat_id": chat_id})
+        else:
+            # Bot was removed for any other reason (dialog closed, timeout, etc.)
             await storage.mark_session_closed(chat_id)
+            log.info("bot_delete_session_closed", extra={"chat_id": chat_id, "prev_state": cur})
 
 
 # ---------------------------------------------------------------------------

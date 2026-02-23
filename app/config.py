@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # contains the numeric ID, or call imopenlines.config.list.
     b24_openline_id: int = Field(default=0, alias="B24_OPENLINE_ID")
 
+    # How many seconds of operator silence before the bot resumes answering.
+    # After imopenlines.bot.session.operator is called, if the operator does
+    # not send any message within this window, the bot takes over again.
+    # Default: 5 minutes.
+    operator_timeout_s: int = Field(default=300, alias="OPERATOR_TIMEOUT_S")
+
     @property
     def b24_imbot_event_handler(self) -> str:
         return f"https://{self.public_domain}/b24/imbot/events"

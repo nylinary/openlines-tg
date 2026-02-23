@@ -170,6 +170,21 @@ class Storage:
         await self._redis.hset(key, mapping={"state": "transferred", "ts": str(int(time.time()))})
         await self._redis.expire(key, self._SESSION_TTL)
 
+    async def mark_session_transferred_full(
+        self,
+        chat_id: str,
+        *,
+        dialog_id: str = "",
+    ) -> None:
+        """Mark transferred and also store/update dialog_id for the watchdog."""
+        key = f"{self._SESSION_PREFIX}{chat_id}"
+        await self._ensure_session_hash(key)
+        mapping: Dict[str, str] = {"state": "transferred", "ts": str(int(time.time()))}
+        if dialog_id:
+            mapping["dialog_id"] = dialog_id
+        await self._redis.hset(key, mapping=mapping)
+        await self._redis.expire(key, self._SESSION_TTL)
+
     async def mark_session_active(self, chat_id: str) -> None:
         """Mark that the bot is active in this chat."""
         key = f"{self._SESSION_PREFIX}{chat_id}"
