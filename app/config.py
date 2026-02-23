@@ -11,11 +11,8 @@ class Settings(BaseSettings):
     app_host: str = Field(default="0.0.0.0")
     app_port: int = Field(default=8000)
 
-    # Bitrix24 (OAuth local app)
+    # Bitrix24
     b24_domain: str = Field(alias="B24_DOMAIN")  # e.g. b24-gko4ik.bitrix24.ru
-    b24_client_id: str = Field(alias="B24_CLIENT_ID")
-    b24_client_secret: str = Field(alias="B24_CLIENT_SECRET")
-    b24_redirect_uri: str = Field(alias="B24_REDIRECT_URI")  # must match app settings in Bitrix
 
     # Public domain where Bitrix can reach the service
     public_domain: str = Field(alias="PUBLIC_DOMAIN")

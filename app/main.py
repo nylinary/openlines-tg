@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 
 from .ai_chat import AIChatHandler
-from .bitrix import BitrixClient, BitrixError, BitrixOAuthError
+from .bitrix import BitrixClient, BitrixError
 from .config import Settings, get_settings
 from .database import Database
 from .llm import LLMError, create_llm_provider
@@ -49,9 +47,6 @@ async def _startup() -> None:
 
     app.state.bitrix = BitrixClient(
         domain=settings.b24_domain,
-        client_id=settings.b24_client_id,
-        client_secret=settings.b24_client_secret,
-        redirect_uri=settings.b24_redirect_uri,
         storage=app.state.storage,
         timeout_s=settings.http_timeout_s,
         retries=settings.http_retries,
@@ -98,13 +93,6 @@ async def _startup() -> None:
             log.warning("stt_disabled", extra={"error": str(e)})
     else:
         log.info("stt_disabled", extra={"reason": "STT_ENABLED=false or no API key"})
-
-    # Verify OAuth token is available (non-fatal)
-    try:
-        await app.state.bitrix.ensure_token()
-        log.info("bitrix_oauth_ok")
-    except BitrixOAuthError:
-        log.warning("bitrix_oauth_not_installed", extra={"hint": "open /b24/install to authorize app"})
 
     # --- Background scraper task ---
     app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
@@ -327,10 +315,10 @@ async def _call_b24(
     method: str,
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Call a Bitrix REST method via webhook (preferred) or OAuth fallback."""
-    if settings.b24_webhook_url:
-        return await bitrix.call_webhook(settings.b24_webhook_url, method, params)
-    return await bitrix.call(method, params)
+    """Call a Bitrix REST method via webhook."""
+    if not settings.b24_webhook_url:
+        raise BitrixError("B24_WEBHOOK_URL is not configured")
+    return await bitrix.call_webhook(settings.b24_webhook_url, method, params)
 
 
 async def _send_bot_message(
@@ -394,39 +382,45 @@ async def _extract_voice_text(
     *,
     event_auth: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Try to extract and transcribe a voice message from the event params.
+    """Transcribe a voice/audio file attached to an ONIMBOTMESSAGEADD event.
 
-    Bitrix sends file attachments in ONIMBOTMESSAGEADD under the PARAMS
-    as ``FILES`` — a dict mapping file indices to file info dicts, each
-    containing ``type``, ``name``, ``urlDownload``, ``size``,
-    ``viewerAttrs`` (with ``viewerType``), etc.
+    Strategy:
+      1. Call ``im.disk.file.save`` (via webhook) to copy the chat-only file
+         into the webhook user's personal Disk storage. Returns a real disk
+         file ID that we can access with ``disk.file.get``.
+      2. Call ``disk.file.get`` to get a proper ``DOWNLOAD_URL``.
+      3. Download the bytes and send to Whisper.
 
-    If no voice file is found, returns None.
-    If transcription succeeds, returns the transcribed text.
-    If transcription fails, returns a fallback error string.
+    Returns:
+      Transcribed text, ``"[voice_error]"`` on download/transcription failure,
+      or ``None`` if no audio file was found in the event.
     """
     stt: Optional[SpeechToText] = getattr(app.state, "stt", None)
     if not stt:
         return None
 
     files_raw = params.get("FILES")
+    nested_params_debug = params.get("PARAMS")
+    log.info("voice_extract_raw", extra={
+        "dialog_id": dialog_id,
+        "message_id": message_id,
+        "has_FILES": bool(files_raw),
+        "FILES_keys": sorted(files_raw.keys()) if isinstance(files_raw, dict) else None,
+        "nested_PARAMS_FILE_ID": str(nested_params_debug.get("FILE_ID", "")) if isinstance(nested_params_debug, dict) else None,
+    })
     if not files_raw or not isinstance(files_raw, dict):
         return None
 
-    # Find first audio/voice file
-    voice_url: Optional[str] = None
+    # Find the first audio/voice file in FILES dict
     voice_file_id: Optional[str] = None
     voice_name: str = "voice.ogg"
-    voice_mime: str = ""
 
-    file_entries = files_raw.values() if isinstance(files_raw, dict) else []
-    for f in file_entries:
+    for f in files_raw.values():
         if not isinstance(f, dict):
             continue
         fname = str(f.get("name", "") or "")
         ftype = str(f.get("type", "") or "")
         fid = str(f.get("id", "") or "")
-        flink = str(f.get("urlDownload", "") or f.get("urlShow", "") or f.get("link", "") or "")
         viewer_attrs = f.get("viewerAttrs") or {}
         viewer_type = str(viewer_attrs.get("viewerType", "") or "") if isinstance(viewer_attrs, dict) else ""
 
@@ -437,165 +431,114 @@ async def _extract_voice_text(
             "file_id": fid,
             "mime_type": ftype,
             "viewer_type": viewer_type,
-            "link": flink[:100] if flink else "",
         })
 
         if is_voice_file(mime_type=ftype, filename=fname, viewer_type=viewer_type):
-            voice_url = flink
             voice_file_id = fid
             voice_name = fname or "voice.ogg"
-            voice_mime = ftype
             break
 
-    if not voice_url and not voice_file_id:
+    if not voice_file_id:
         return None
 
     log.info("voice_message_detected", extra={
         "dialog_id": dialog_id,
         "message_id": message_id,
         "file_name": voice_name,
-        "file_id": voice_file_id or "",
-        "mime_type": voice_mime,
-        "url": voice_url[:100] if voice_url else "",
+        "file_id": voice_file_id,
     })
 
     audio_bytes: Optional[bytes] = None
+    wh = settings.b24_webhook_url or None
 
-    # Strategy 1: event auth token → disk.file.get (best, if token present)
-    if not audio_bytes and voice_file_id and event_auth:
-        event_token = str(event_auth.get("access_token", "") or "")
-        event_domain = str(event_auth.get("domain", "") or "")
-        if event_token and event_domain:
-            try:
-                audio_bytes = await bitrix.download_file_by_event_token(
-                    voice_file_id,
-                    access_token=event_token,
-                    domain=event_domain,
-                )
-                log.info("voice_download_event_token_ok", extra={
-                    "dialog_id": dialog_id,
-                    "file_id": voice_file_id,
-                    "domain": event_domain,
-                    "size_bytes": len(audio_bytes) if audio_bytes else 0,
-                })
-            except (BitrixError, Exception) as e:
-                log.warning("voice_download_event_token_failed", extra={
-                    "dialog_id": dialog_id,
-                    "file_id": voice_file_id,
-                    "domain": event_domain,
-                    "error": str(e),
-                })
-        else:
-            # OpenLines connector events sometimes omit access_token and only include member/application_token.
-            log.info("voice_event_auth_missing_access_token", extra={
-                "dialog_id": dialog_id,
-                "has_auth": True,
-                "auth_keys": sorted(list(event_auth.keys())) if isinstance(event_auth, dict) else [],
-            })
+    # -----------------------------------------------------------------------
+    # Step 1: im.disk.file.save — copy the chat file into the webhook user's
+    # Disk so we get a real disk file ID accessible via disk.file.get.
+    # https://apidocs.bitrix24.com/api-reference/chats/files/im-disk-file-save.html
+    # -----------------------------------------------------------------------
+    disk_file_id: Optional[str] = None
+    try:
+        if not wh:
+            raise BitrixError("B24_WEBHOOK_URL is not configured")
+        save_resp = await bitrix.call_webhook(wh, "im.disk.file.save", {"FILE_ID": voice_file_id})
 
-    # Strategy 1b: call disk.file.get on the event domain using our stored OAuth token
-    # (works when Bitrix doesn't provide auth.access_token in connector events).
-    if not audio_bytes and voice_file_id and event_auth:
-        event_domain = str(event_auth.get("domain", "") or "").strip()
-        client_endpoint = str(event_auth.get("client_endpoint", "") or "").strip()
-        domain = event_domain
-        if not domain and client_endpoint:
-            try:
-                domain = urlparse(client_endpoint).netloc
-            except Exception:
-                domain = ""
+        save_result = save_resp.get("result", {})
+        log.info("voice_im_disk_file_save", extra={
+            "dialog_id": dialog_id,
+            "file_id": voice_file_id,
+            "result": str(save_result)[:300],
+        })
 
-        if domain:
-            try:
-                token = await bitrix.ensure_token()
-                from .bitrix import _redact_bitrix_url  # type: ignore
+        # im.disk.file.save returns {"folder": {...}, "file": {"id": N, "name": "..."}}
+        # Handle both the new nested format and the older flat/scalar formats.
+        if isinstance(save_result, dict):
+            file_obj = save_result.get("file") or save_result.get("FILE") or {}
+            if isinstance(file_obj, dict):
+                disk_file_id = str(file_obj.get("id") or file_obj.get("ID") or "")
+            if not disk_file_id:
+                disk_file_id = str(save_result.get("ID") or save_result.get("id") or "")
+        elif save_result:
+            disk_file_id = str(save_result)
 
-                meta_url = f"https://{domain}/rest/disk.file.get.json?auth={token}"
-                log.info("voice_download_domain_oauth_meta", extra={
-                    "dialog_id": dialog_id,
-                    "file_id": voice_file_id,
-                    "domain": domain,
-                    "url": _redact_bitrix_url(meta_url)[:120],
-                })
+    except (BitrixError, Exception) as e:
+        log.warning("voice_im_disk_file_save_failed", extra={
+            "dialog_id": dialog_id,
+            "file_id": voice_file_id,
+            "error": str(e),
+        })
 
-                r = await bitrix._client.post(meta_url, data={"id": voice_file_id})
-                payload = r.json() if r.text else {}
-                if isinstance(payload, dict) and payload.get("error"):
-                    raise BitrixError(f"{payload.get('error')}: {payload.get('error_description', '')}")
-
-                result = payload.get("result", {})
-                if not isinstance(result, dict):
-                    raise BitrixError(f"Unexpected disk.file.get result: {payload}")
-
-                dl_url = str(result.get("DOWNLOAD_URL", "") or "")
-                if not dl_url:
-                    raise BitrixError("disk.file.get returned no DOWNLOAD_URL")
-
-                r2 = await bitrix._client.get(dl_url, follow_redirects=True)
-                r2.raise_for_status()
-                ct = r2.headers.get("content-type", "")
-                if "text/html" in ct:
-                    raise BitrixError(f"DOWNLOAD_URL returned HTML (content-type: {ct})")
-
-                audio_bytes = r2.content
-                log.info("voice_download_domain_oauth_ok", extra={
-                    "dialog_id": dialog_id,
-                    "file_id": voice_file_id,
-                    "domain": domain,
-                    "size_bytes": len(audio_bytes) if audio_bytes else 0,
-                })
-            except Exception as e:
-                log.warning("voice_download_domain_oauth_failed", extra={
-                    "dialog_id": dialog_id,
-                    "file_id": voice_file_id,
-                    "domain": domain,
-                    "error": str(e),
-                })
-
-    # Strategy 2: direct URL download (often returns HTML wrapper)
-    if not audio_bytes and voice_url:
+    # -----------------------------------------------------------------------
+    # Step 2: disk.file.get — get DOWNLOAD_URL for the saved disk file
+    # -----------------------------------------------------------------------
+    if disk_file_id:
         try:
-            audio_bytes = await bitrix.download_file(voice_url)
-        except (BitrixError, Exception) as e:
-            log.warning("voice_download_url_failed", extra={
+            if not wh:
+                raise BitrixError("B24_WEBHOOK_URL is not configured")
+            get_resp = await bitrix.call_webhook(wh, "disk.file.get", {"id": disk_file_id})
+
+            get_result = get_resp.get("result", {})
+            dl_url = str(get_result.get("DOWNLOAD_URL", "") or "") if isinstance(get_result, dict) else ""
+            log.info("voice_disk_file_get", extra={
                 "dialog_id": dialog_id,
-                "error": str(e),
-                "url": voice_url[:100],
+                "disk_file_id": disk_file_id,
+                "has_url": bool(dl_url),
             })
 
-    # Strategy 3: disk.file.get via webhook (may be ACCESS_DENIED)
-    if not audio_bytes and voice_file_id:
-        try:
-            audio_bytes = await bitrix.download_file_by_id(
-                voice_file_id,
-                webhook_url=settings.b24_webhook_url or None,
-            )
-            log.info("voice_download_by_id_ok", extra={
-                "dialog_id": dialog_id,
-                "file_id": voice_file_id,
-                "size_bytes": len(audio_bytes) if audio_bytes else 0,
-            })
+            if dl_url:
+                r = await bitrix._client.get(dl_url, follow_redirects=True)
+                ct = r.headers.get("content-type", "")
+                if "text/html" not in ct and len(r.content) > 100:
+                    audio_bytes = r.content
+                    log.info("voice_download_ok", extra={
+                        "dialog_id": dialog_id,
+                        "size_bytes": len(audio_bytes),
+                        "content_type": ct,
+                    })
+                else:
+                    log.warning("voice_disk_download_bad_content", extra={
+                        "dialog_id": dialog_id,
+                        "content_type": ct,
+                        "size": len(r.content),
+                        "body_preview": r.text[:200] if "text/html" in ct else "",
+                    })
         except (BitrixError, Exception) as e:
-            log.warning("voice_download_by_id_failed", extra={
+            log.warning("voice_disk_file_get_failed", extra={
                 "dialog_id": dialog_id,
-                "file_id": voice_file_id,
+                "disk_file_id": disk_file_id,
                 "error": str(e),
             })
 
     if not audio_bytes:
         log.warning("voice_download_all_failed", extra={
             "dialog_id": dialog_id,
-            "file_id": voice_file_id or "",
+            "chat_file_id": voice_file_id,
+            "disk_file_id": disk_file_id or "none",
         })
         return None
 
-    log.info("voice_downloaded", extra={
-        "dialog_id": dialog_id,
-        "size_bytes": len(audio_bytes),
-        "file_name": voice_name,
-    })
-
-    # Transcribe via Whisper
+    # -----------------------------------------------------------------------
+    # Step 3: transcribe via Whisper
+    # -----------------------------------------------------------------------
     try:
         transcript = await stt.transcribe(
             audio_bytes,
@@ -1103,41 +1046,5 @@ async def catalog_search(
     return {"query": q, "count": len(results), "products": results}
 
 
-# ---------------------------------------------------------------------------
-# Bitrix OAuth install flow
-# ---------------------------------------------------------------------------
 
 
-@app.get("/b24/install")
-async def b24_install(
-    storage: Storage = Depends(storage_dep),
-    settings: Settings = Depends(settings_dep),
-) -> Dict[str, str]:
-    """Generate Bitrix OAuth authorization URL."""
-    state = secrets.token_urlsafe(24)
-    await storage.dedupe_set(f"b24:oauth:state:{state}", ttl_s=10 * 60)
-
-    url = app.state.bitrix.auth_url(state=state)
-    return {"auth_url": url}
-
-
-@app.get("/b24/oauth/callback")
-async def b24_oauth_callback(
-    code: Optional[str] = Query(default=None),
-    state: Optional[str] = Query(default=None),
-    storage: Storage = Depends(storage_dep),
-) -> Dict[str, str]:
-    """Handle Bitrix OAuth redirect with authorization code."""
-    if not code or not state:
-        raise HTTPException(status_code=400, detail="missing code/state")
-
-    fresh = await storage.dedupe_set(f"b24:oauth:state_used:{state}", ttl_s=10 * 60)
-    if not fresh:
-        raise HTTPException(status_code=400, detail="state already used")
-
-    try:
-        await app.state.bitrix.exchange_code(code)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"oauth exchange failed: {e}")
-
-    return {"ok": "true"}
