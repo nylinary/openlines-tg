@@ -696,13 +696,6 @@ async def b24_imbot_events(
                 "text_length": len(text),
             })
 
-            # Send the recognised text back to the user so they see what
-            # the bot "heard" (makes the conversation transparent).
-            await _send_bot_message(
-                bitrix, settings, dialog_id,
-                f"🎤 Распознано: {voice_transcript}",
-            )
-
         if not text:
             log.info("imbot_event_ignored", extra={"reason": "empty_message"})
             return {"ok": "true"}
