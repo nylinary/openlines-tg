@@ -16,4 +16,13 @@ echo "       Migrations OK ✓"
 #    automatically scrape myryba.ru on startup.
 # -------------------------------------------------------
 echo "[2/2] Starting uvicorn …"
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+# --proxy-headers  : trust X-Forwarded-Proto / X-Forwarded-For from the reverse proxy
+#                    so that Starlette's url_for() generates https:// URLs and sqladmin
+#                    CSS/JS assets are not blocked as mixed content.
+# --forwarded-allow-ips='*' : allow the header from any upstream (the proxy is the only
+#                    client that can reach port 8000 inside Docker).
+exec uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --proxy-headers \
+    --forwarded-allow-ips='*'
