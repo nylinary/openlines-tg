@@ -37,6 +37,24 @@ class BasicAuthBackend(AuthenticationBackend):
         self._username = username
         self._password = password
 
+        # Override the default SessionMiddleware added by sqladmin so the
+        # session cookie is sent with SameSite=None; Secure.  This is required
+        # when the admin panel is opened inside a Bitrix24 iFrame because the
+        # browser treats it as a third-party context and silently drops cookies
+        # that use the default SameSite=Lax policy.
+        from starlette.middleware import Middleware
+        from starlette.middleware.sessions import SessionMiddleware
+
+        self.middlewares = [
+            Middleware(
+                SessionMiddleware,
+                secret_key=secret_key,
+                same_site="none",
+                https_only=True,   # SameSite=None is only valid over HTTPS
+                session_cookie="sqladmin_session",
+            ),
+        ]
+
     async def login(self, request: Request) -> bool:
         form = await request.form()
         user = str(form.get("username", ""))
