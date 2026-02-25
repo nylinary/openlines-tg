@@ -12,7 +12,7 @@ open (suitable only for local/internal use).
 from __future__ import annotations
 
 import secrets
-from typing import Optional
+from typing import Optional  # noqa: F401 — kept for type hints elsewhere
 
 from sqladmin import Admin, ModelView
 from sqladmin.authentication import AuthenticationBackend
@@ -50,9 +50,9 @@ class BasicAuthBackend(AuthenticationBackend):
         request.session.clear()
         return True
 
-    async def authenticate(self, request: Request) -> Optional[RedirectResponse]:
+    async def authenticate(self, request: Request) -> bool | RedirectResponse:
         if request.session.get("admin_authenticated") == "1":
-            return None  # authenticated
+            return True  # authenticated — sqladmin checks bool(response)
         return RedirectResponse(request.url_for("admin:login"), status_code=302)
 
 
