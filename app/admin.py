@@ -1,6 +1,6 @@
 """sqladmin-based admin panel for the Bitrix imbot service.
 
-Mounts at ``/admin`` and provides:
+Mounts at the path set by ``settings.admin_path`` (default ``/manage``) and provides:
 - Company info editor (single-row table)
 - Read-only product catalog browser
 - Read-only chat message viewer
@@ -215,6 +215,7 @@ def create_admin(app, engine, settings: Settings) -> Admin:
         app,
         engine,
         title="МояРыба — Панель управления",
+        base_url=settings.admin_path,
         authentication_backend=auth_backend,
     )
 

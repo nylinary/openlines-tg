@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     # If left empty the panel is open (suitable only behind a private network).
     admin_username: str = Field(default="admin", alias="ADMIN_USERNAME")
     admin_password: str = Field(default="", alias="ADMIN_PASSWORD")
+    # URL prefix for the sqladmin panel.
+    # Default is /manage so it does not collide with the Bitrix local-app
+    # handler at /b24/app.  Override with ADMIN_PATH env var if needed.
+    admin_path: str = Field(default="/admin", alias="ADMIN_PATH")
 
     @property
     def b24_imbot_event_handler(self) -> str:

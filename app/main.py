@@ -5,6 +5,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Query, Request
+from fastapi.responses import RedirectResponse
 
 from .admin import create_admin
 from .ai_chat import AIChatHandler
@@ -107,10 +108,10 @@ async def _startup() -> None:
     else:
         log.info("stt_disabled", extra={"reason": "STT_ENABLED=false or no API key"})
 
-    # --- sqladmin panel (mounted at /admin) ---
+    # --- sqladmin panel ---
     if app.state.db:
         create_admin(app, app.state.db._engine, settings)
-        log.info("admin_panel_mounted", extra={"path": "/admin"})
+        log.info("admin_panel_mounted", extra={"path": settings.admin_path})
 
     # --- Background scraper task ---
     app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
@@ -299,6 +300,36 @@ def catalog_dep() -> ProductCatalog:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"ok": "true"}
+
+
+# ---------------------------------------------------------------------------
+# Bitrix local app handler
+# ---------------------------------------------------------------------------
+# Bitrix calls this URL (GET + POST) when the user opens the local app from
+# the Bitrix24 sidebar.  We simply redirect the browser to the real admin
+# panel so the iFrame loads the right page.
+#
+# IMPORTANT: This handler lives at /b24/app — NOT at /admin — so it does not
+# collide with the sqladmin panel that is mounted at settings.admin_path
+# (default /admin).  Set the "Handler path" in the Bitrix24 local-app settings
+# to:  https://<your-domain>/b24/app
+
+
+@app.get("/b24/app")
+@app.post("/b24/app")
+async def bitrix_app_handler(
+    settings: Settings = Depends(settings_dep),
+) -> RedirectResponse:
+    """Bitrix local app entry-point — redirect to the admin panel.
+
+    Bitrix opens this URL inside an iFrame when the user clicks the app in
+    the sidebar.  We redirect to the real sqladmin panel path so the browser
+    ends up at the correct URL.
+
+    The 302 redirect works fine inside the Bitrix iFrame because Bitrix does
+    not block same-origin redirects.
+    """
+    return RedirectResponse(url=settings.admin_path + "/", status_code=302)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,7 +1230,7 @@ async def catalog_search(
 # ---------------------------------------------------------------------------
 
 
-@app.post("/admin/company-info/reload")
+@app.post("/b24/manage/company-info/reload")
 async def reload_company_info() -> Dict[str, Any]:
     """Reload company info from DB into app state and invalidate AI prompt cache.
 
@@ -1229,7 +1260,7 @@ async def reload_company_info() -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-@app.get("/admin/company-info")
+@app.get("/b24/manage/company-info")
 async def get_company_info() -> Dict[str, Any]:
     """Return the current company info as stored in DB."""
     db: Optional[Database] = getattr(app.state, "db", None)
