@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Query, Request
 
+from .admin import create_admin
 from .ai_chat import AIChatHandler
 from .bitrix import BitrixClient, BitrixError
 from .config import Settings, get_settings
@@ -56,6 +57,17 @@ async def _startup() -> None:
     app.state.catalog = ProductCatalog(db=app.state.db)
     await app.state.catalog.load_from_db()
 
+    # --- Company info (load once; injected into AI prompt) ---
+    app.state.company_info_block = ""
+    if app.state.db:
+        try:
+            company = await app.state.db.get_company_info()
+            if company:
+                app.state.company_info_block = company.to_prompt_block()
+                log.info("company_info_loaded")
+        except Exception as e:
+            log.warning("company_info_load_failed", extra={"error": str(e)})
+
     # --- LLM provider (optional — gracefully degrade if not configured) ---
     app.state.llm_provider = None  # Optional[LLMProvider]
     app.state.ai_chat = None  # Optional[AIChatHandler]
@@ -74,6 +86,7 @@ async def _startup() -> None:
             llm=llm,
             catalog=app.state.catalog,
             storage=app.state.storage,
+            company_info_fn=lambda: getattr(app.state, "company_info_block", ""),
         )
         log.info("llm_provider_enabled", extra={"provider": llm.provider_name})
     except (ValueError, LLMError) as e:
@@ -93,6 +106,11 @@ async def _startup() -> None:
             log.warning("stt_disabled", extra={"error": str(e)})
     else:
         log.info("stt_disabled", extra={"reason": "STT_ENABLED=false or no API key"})
+
+    # --- sqladmin panel (mounted at /admin) ---
+    if app.state.db:
+        create_admin(app, app.state.db._engine, settings)
+        log.info("admin_panel_mounted", extra={"path": "/admin"})
 
     # --- Background scraper task ---
     app.state.scraper_task = asyncio.create_task(_scraper_loop(settings, app.state.catalog))
@@ -1174,6 +1192,72 @@ async def catalog_search(
     """Search the product catalog."""
     results = catalog.search(q, limit=limit)
     return {"query": q, "count": len(results), "products": results}
+
+
+# ---------------------------------------------------------------------------
+# Company info management endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/admin/company-info/reload")
+async def reload_company_info() -> Dict[str, Any]:
+    """Reload company info from DB into app state and invalidate AI prompt cache.
+
+    Call this after editing company info in the admin panel so the AI picks
+    up the changes without a full restart.
+    """
+    db: Optional[Database] = getattr(app.state, "db", None)
+    if not db:
+        return {"ok": False, "error": "database not connected"}
+
+    try:
+        company = await db.get_company_info()
+        if company:
+            app.state.company_info_block = company.to_prompt_block()
+            log.info("company_info_reloaded")
+        else:
+            app.state.company_info_block = ""
+
+        # Invalidate the cached system prompt so next AI call uses fresh data
+        ai_chat: Optional[AIChatHandler] = getattr(app.state, "ai_chat", None)
+        if ai_chat:
+            ai_chat.invalidate_system_prompt_cache()
+
+        return {"ok": True, "block_length": len(app.state.company_info_block)}
+    except Exception as e:
+        log.error("company_info_reload_failed", extra={"error": str(e)})
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/admin/company-info")
+async def get_company_info() -> Dict[str, Any]:
+    """Return the current company info as stored in DB."""
+    db: Optional[Database] = getattr(app.state, "db", None)
+    if not db:
+        return {"ok": False, "error": "database not connected"}
+
+    try:
+        company = await db.get_company_info()
+        if company is None:
+            return {"ok": True, "data": None}
+        return {
+            "ok": True,
+            "data": {
+                "company_name": company.company_name,
+                "address": company.address,
+                "phone": company.phone,
+                "email": company.email,
+                "website": company.website,
+                "working_hours": company.working_hours,
+                "delivery_info": company.delivery_info,
+                "payment_info": company.payment_info,
+                "extra_faq": company.extra_faq,
+                "updated_at": company.updated_at.isoformat() if company.updated_at else None,
+            },
+            "prompt_block": app.state.company_info_block,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 

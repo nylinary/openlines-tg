@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     # Default: 5 minutes.
     operator_timeout_s: int = Field(default=300, alias="OPERATOR_TIMEOUT_S")
 
+    # Admin panel
+    # Secret key for signing session cookies (change in production!).
+    admin_secret: str = Field(default="change-me-in-production", alias="ADMIN_SECRET")
+    # Optional HTTP Basic auth for the admin panel (user:password).
+    # If left empty the panel is open (suitable only behind a private network).
+    admin_username: str = Field(default="admin", alias="ADMIN_USERNAME")
+    admin_password: str = Field(default="", alias="ADMIN_PASSWORD")
+
     @property
     def b24_imbot_event_handler(self) -> str:
         return f"https://{self.public_domain}/b24/imbot/events"

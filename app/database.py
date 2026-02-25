@@ -23,13 +23,17 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from .models import Base, ChatMessage, Product, ScrapeMeta
+from .models import Base, ChatMessage, CompanyInfo, Product, ScrapeMeta
 
 log = logging.getLogger("app.database")
 
 # Seed the single-row scrape_meta table.
 _SEED_SCRAPE_META_SQL = """\
 INSERT INTO scrape_meta (id) VALUES (1) ON CONFLICT DO NOTHING;
+"""
+
+_SEED_COMPANY_INFO_SQL = """\
+INSERT INTO company_info (id) VALUES (1) ON CONFLICT DO NOTHING;
 """
 
 
@@ -62,6 +66,7 @@ class Database:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.execute(text(_SEED_SCRAPE_META_SQL))
+            await conn.execute(text(_SEED_COMPANY_INFO_SQL))
         log.info("pg_connected_and_migrated", extra={"dsn": _mask_dsn(self._dsn)})
 
     async def close(self) -> None:
@@ -270,6 +275,33 @@ class Database:
         if deleted:
             log.info("pg_old_chats_cleaned", extra={"deleted": deleted})
         return deleted
+
+    # ------------------------------------------------------------------
+    # Company info (single-row admin-editable table)
+    # ------------------------------------------------------------------
+
+    async def get_company_info(self) -> Optional[CompanyInfo]:
+        """Return the single CompanyInfo row, or None if not yet seeded."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(CompanyInfo).where(CompanyInfo.id == 1)
+            )
+            return result.scalar_one_or_none()
+
+    async def set_company_info(self, **fields: Any) -> None:
+        """Update company info fields.  Creates the row if it doesn't exist."""
+        if not fields:
+            return
+        async with self._session_factory() as session:
+            async with session.begin():
+                existing = await session.get(CompanyInfo, 1)
+                if existing is None:
+                    existing = CompanyInfo(id=1)
+                    session.add(existing)
+                for key, value in fields.items():
+                    if hasattr(existing, key):
+                        setattr(existing, key, value)
+        log.info("pg_company_info_updated", extra={"fields": list(fields.keys())})
 
 
 # ---------------------------------------------------------------------------
